@@ -17,13 +17,14 @@ class RequestStatus(Enum):
 
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id, client_id=None, input_hash_ids=None, output_hash_ids=None, is_init=True):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
         self.output = output
         self.arrival = arrival
         self.instance_id = instance_id
+        self.client_id = client_id
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
@@ -69,6 +70,13 @@ class Request:
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None
         self.sub_request_index = None
+
+        self.routing_fairness_debt = 0.0
+        self.routing_fairness_urgency = 0.0
+        self.routing_locality = 0.0
+        self.routing_prediction = 0.0
+        self.routing_score = 0.0
+        self.routing_policy = ""
 
     # to print the request information
     def __str__(self):

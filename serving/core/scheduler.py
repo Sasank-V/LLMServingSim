@@ -467,7 +467,7 @@ class Scheduler:
         # that has not arrived yet. Dynamically released agentic sub-requests
         # arrive mid-run, hence insort rather than append.
         bisect.insort(self.waiting, new_req, key=lambda r: (r.arrival, r.id))
-        return
+        return new_req
 
     def add_decode(self, req):
         """Take over a request whose prefill ran on another instance.
@@ -547,15 +547,19 @@ class Scheduler:
             
             # Write the column headers
             if not is_append:
-                writer.writerow(['instance id', 'request id', 'model', 'input', 'output', 
-                                'arrival', 'end_time', 'latency', 
-                                'queuing_delay', 'TTFT', 'TPOT', 'ITL'])
+                writer.writerow([
+                    'instance id', 'request id', 'client id', 'model', 'input', 'output',
+                    'arrival', 'end_time', 'latency', 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
+                    'routing policy', 'fairness debt', 'fairness urgency',
+                    'locality', 'prediction', 'routing score'
+                ])
             
             # Write each request's information
             for req in self.done:
                 writer.writerow([
                     req.instance_id,
                     req.id,
+                    req.client_id,
                     req.model,
                     req.input,
                     req.output - req.input,
@@ -565,7 +569,13 @@ class Scheduler:
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl
+                    req.itl,
+                    getattr(req, 'routing_policy', ''),
+                    getattr(req, 'routing_fairness_debt', 0.0),
+                    getattr(req, 'routing_fairness_urgency', 0.0),
+                    getattr(req, 'routing_locality', 0.0),
+                    getattr(req, 'routing_prediction', 0.0),
+                    getattr(req, 'routing_score', 0.0),
                 ])
 
 

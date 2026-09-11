@@ -1,6 +1,28 @@
 import bisect
 import json
 import random
+from .request import Request
+from .algorithms.fairness import (
+    FairnessTracker,
+    fairness_debt,
+    fairness_target,
+    fairness_urgency,
+)
+from .algorithms.fairroute import (
+    fairroute_score,
+    score_aflc,
+    score_fairness_gated,
+    score_linear,
+    score_multiplicative,
+)
+from .algorithms.locality import locality_score
+from .algorithms.prediction import (
+    predict_queue,
+    prediction_benefit,
+    prediction_risk,
+    replica_is_safe,
+)
+from .algorithms.utils import kv_utilization, load_benefit, reactive_load
 from .logger import get_logger
 
 
@@ -10,7 +32,8 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            custom_routing_fn=None,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -24,6 +47,11 @@ class Router:
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
+        self.fairness_tracker = FairnessTracker()
+        self._request_clients = {}
+        self._request_service = {}
+        self.custom_routing_fn = custom_routing_fn
+        self._routing_policy_names = {"H0", "H1", "H2", "H3", "H4", "FAIRROUTE"}
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -42,11 +70,13 @@ class Router:
             self._select_instance = self._rand_select
         elif self.routing_policy == "LOAD":
             self._select_instance = self._least_load_select
+        elif self.routing_policy in self._routing_policy_names:
+            self._select_instance = self._fair_route
         elif self.routing_policy == "CUSTOM":
-            self._select_instance = self._custom_select
+            self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, CUSTOM")
+                             "Supported: RR, RAND, LOAD, H0, H1, H2, H3, H4, FAIRROUTE")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -93,8 +123,109 @@ class Router:
         self._set_counter(role, (best_idx + 1) % num_instances)
         return best_idx
 
-    def _custom_select(self, schedulers, role):
-        raise NotImplementedError("Implement custom routing policy.")
+    def _fair_route(self, schedulers, role, req_data=None):
+        if req_data is None:
+            raise RuntimeError("FairRoute selection requires request data")
+        return self._select_fairroute_candidate(schedulers, req_data)
+
+    def _request_to_route_data(self, req):
+        """Build the same candidate input for routed and handed-off requests."""
+        return {
+            'index': req.id,
+            'input_toks': req.original_input,
+            'output_toks': req.output,
+            'arrival_time_ns': req.arrival,
+            'client_id': req.client_id,
+            'input_hash_ids': req.input_hash_ids or [],
+            'output_hash_ids': req.output_hash_ids or [],
+        }
+
+    def _custom_select(self, schedulers, role, req_data):
+        if self.custom_routing_fn is None:
+            raise RuntimeError(
+                "CUSTOM routing requires custom_routing_fn=(schedulers, role, req_data) "
+                "when constructing Router"
+            )
+        result = self.custom_routing_fn(schedulers, role, req_data)
+        if isinstance(result, int):
+            return result, 0.0, (0.0, 0.0, 0.0, 0.0, 0)
+        if len(result) != 3:
+            raise ValueError(
+                "custom_routing_fn must return (instance_index, score, metrics)"
+            )
+        return result
+
+    def _replica_locality(self, sched, req_data):
+        """Return prefix reuse without mutating the request being routed."""
+        input_hash_ids = req_data.get('input_hash_ids', [])
+        if not sched.enable_prefix_caching or not input_hash_ids:
+            return 0
+        probe = Request(
+            req_data['index'], sched.model, req_data['input_toks'],
+            req_data['output_toks'], req_data['arrival_time_ns'],
+            sched.instance_id, req_data.get('client_id'), input_hash_ids,
+            req_data.get('output_hash_ids', []), is_init=self._is_init,
+        )
+        _, npu_hit, lower_hit = sched.memory.kv.get_computed_blocks(probe)
+        return min(req_data['input_toks'], npu_hit + lower_hit)
+
+    def _replica_prediction(self, sched):
+        waiting = len(sched.waiting)
+        running = len(sched.running)
+        capacity = getattr(sched, 'max_num_seqs', 0)
+        load = reactive_load(waiting, running, capacity)
+        predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
+        pool = getattr(sched.memory, 'npu_pool', None)
+        used_blocks = getattr(pool, 'used_blocks', 0) if pool else 0
+        total_blocks = getattr(pool, 'num_blocks', 0) if pool else 0
+        kv_util = kv_utilization(used_blocks, total_blocks)
+        return load, predicted_queue, kv_util
+
+    def _select_fairroute_candidate(self, schedulers, req_data):
+        client_id = req_data.get('client_id', 'default')
+        total_service = sum(self.fairness_tracker.service.values())
+        clients = set(self.fairness_tracker.service)
+        clients.add(client_id)
+        target = fairness_target(total_service, len(clients))
+        debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
+        urgency = fairness_urgency(debt)
+        candidates = []
+
+        for index, sched in enumerate(schedulers):
+            hit = self._replica_locality(sched, req_data)
+            locality = locality_score(hit, req_data['input_toks'])
+            load, predicted_queue, kv_util = self._replica_prediction(sched)
+            capacity = getattr(sched, 'max_num_seqs', 0)
+            max_queue = max(1, capacity * 4) if capacity not in (0, float('inf')) else float('inf')
+            safe = replica_is_safe(predicted_queue, max_queue, kv_util)
+            reactive_prediction = load_benefit(load)
+            risk = prediction_risk(predicted_queue, kv_util)
+            predictive = prediction_benefit(risk, max(1.0, capacity or 1.0))
+
+            if self.routing_policy == "H0":
+                score = score_linear(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0)
+                prediction = reactive_prediction
+            elif self.routing_policy == "H1":
+                score = score_multiplicative(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0)
+                prediction = reactive_prediction
+            elif self.routing_policy == "H2":
+                score = score_fairness_gated(urgency, 0.5, locality, reactive_prediction)
+                prediction = reactive_prediction
+            elif self.routing_policy == "H3":
+                score = score_aflc(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0, debt)
+                prediction = reactive_prediction
+            else:
+                score = fairroute_score(
+                    debt, urgency, locality, risk,
+                    prediction_temperature=max(1.0, capacity or 1.0),
+                )
+                prediction = predictive
+
+            candidates.append((index, score, safe, hit, locality, prediction))
+
+        safe_candidates = [candidate for candidate in candidates if candidate[2]]
+        selected = max(safe_candidates or candidates, key=lambda candidate: (candidate[1], -candidate[0]))
+        return selected[0], selected[1], (debt, urgency, selected[4], selected[5], selected[3])
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -145,6 +276,7 @@ class Router:
             'input_toks': int(row['input_toks']),
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
+            'client_id': row.get('client_id', 'default'),
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
@@ -166,6 +298,7 @@ class Router:
             'sub_requests': sub_reqs,
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
+            'client_id': row.get('client_id', 'default'),
         }
 
         # Queue the first sub-request
@@ -175,6 +308,7 @@ class Router:
             'input_toks': int(first['input_toks']),
             'output_toks': int(first['input_toks'] + first['output_toks']),
             'arrival_time_ns': arrival_ns,
+            'client_id': row.get('client_id', 'default'),
             'session_id': session_id,
             'sub_request_index': 0,
         }
@@ -198,22 +332,43 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
+            if self.routing_policy == "CUSTOM":
+                instance_id, route_score, route_metrics = self._custom_select(
+                    self.prefill_schedulers, "prefill", req_data)
+            elif self.routing_policy in self._routing_policy_names:
+                instance_id, route_score, route_metrics = self._select_instance(
+                    self.prefill_schedulers, "prefill", req_data)
+            else:
+                instance_id = self._select_instance(self.prefill_schedulers, "prefill")
+                route_score = 0.0
+                route_metrics = (0.0, 0.0, 0.0, 0.0, 0)
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
-                sched.add_request([
+                new_req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
+                    req_data.get('client_id'),
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
                 ], is_init=self._is_init)
             else:
-                sched.add_request([
+                new_req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
+                    req_data.get('client_id'),
                 ], is_init=self._is_init)
+
+            new_req.routing_policy = self.routing_policy
+            new_req.routing_score = route_score
+            (new_req.routing_fairness_debt,
+             new_req.routing_fairness_urgency,
+             new_req.routing_locality,
+             new_req.routing_prediction,
+             _) = route_metrics
+            self._request_clients[new_req.id] = new_req.client_id
+            self._request_service[new_req.id] = new_req.output - new_req.input
 
             self._pending_idx += 1
             routed += 1
@@ -241,6 +396,9 @@ class Router:
         For flat requests (not in a session), this is a no-op.
         """
         session_info = self._request_to_session.pop(request_id, None)
+        client_id = self._request_clients.pop(request_id, 'default')
+        service = self._request_service.pop(request_id, 0)
+        self.fairness_tracker.record_service(client_id, service)
         if session_info is None:
             return
         session_id, completed_idx = session_info
@@ -265,6 +423,7 @@ class Router:
                 'input_toks': int(next_sub['input_toks']),
                 'output_toks': int(next_sub['input_toks'] + next_sub['output_toks']),
                 'arrival_time_ns': release_time_ns,
+                'client_id': session['client_id'],
                 'session_id': session_id,
                 'sub_request_index': next_idx,
             }
@@ -323,5 +482,12 @@ class Router:
 
     def transfer_prefill_request(self, requests):
         for req in requests:
-            instance_id = self._select_instance(self.decode_schedulers, "decode")
+            if self.routing_policy in self._routing_policy_names:
+                instance_id, _, _ = self._select_instance(
+                    self.decode_schedulers,
+                    "decode",
+                    self._request_to_route_data(req),
+                )
+            else:
+                instance_id = self._select_instance(self.decode_schedulers, "decode")
             self.decode_schedulers[instance_id].add_decode(req)
