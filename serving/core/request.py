@@ -76,6 +76,7 @@ class Request:
         self.routing_locality = 0.0
         self.routing_prediction = 0.0
         self.routing_score = 0.0
+        self.routing_score_margin = 0.0
         self.routing_policy = ""
 
     # to print the request information

@@ -14,8 +14,24 @@ from .algorithms.fairroute import (
     score_fairness_gated,
     score_linear,
     score_multiplicative,
+    score_combination,
+    score_preble,
+    score_lbgr,
+    score_dualmap,
+    score_cache_route,
+    score_vtc,
+    score_equinox,
+    score_quartz,
+    score_nexussched,
+    score_pillm,
+    score_balance_route,
+    score_online_lp,
+    normalize_candidates,
 )
-from .algorithms.locality import locality_score
+from .algorithms.locality import (
+    locality_score,
+    adaptive_locality_weight
+)
 from .algorithms.prediction import (
     predict_queue,
     prediction_benefit,
@@ -51,7 +67,12 @@ class Router:
         self._request_clients = {}
         self._request_service = {}
         self.custom_routing_fn = custom_routing_fn
-        self._routing_policy_names = {"H0", "H1", "H2", "H3", "H4", "FAIRROUTE"}
+        self._routing_policy_names = {
+            "H0", "H1", "H2", "H3", "H4", "FAIRROUTE",
+            "FAIRNESS", "LOCALITY", "PREDICTION", "F_L", "L_P", "F_P", "F_L_P",
+            "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE", "VTC", "EQUINOX",
+            "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE", "PILLM", "ONLINE_LP",
+        }
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -76,7 +97,9 @@ class Router:
             self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, H0, H1, H2, H3, H4, FAIRROUTE")
+                             "Supported: RR, RAND, LOAD, H0-H4, FAIRROUTE, "
+                             "FAIRNESS, LOCALITY, PREDICTION, F_L, L_P, F_P, F_L_P, "
+                             "and literature policies")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -148,7 +171,7 @@ class Router:
             )
         result = self.custom_routing_fn(schedulers, role, req_data)
         if isinstance(result, int):
-            return result, 0.0, (0.0, 0.0, 0.0, 0.0, 0)
+            return result, 0.0, (0.0, 0.0, 0.0, 0.0, 0, 0.0)
         if len(result) != 3:
             raise ValueError(
                 "custom_routing_fn must return (instance_index, score, metrics)"
@@ -209,7 +232,16 @@ class Router:
                 score = score_multiplicative(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0)
                 prediction = reactive_prediction
             elif self.routing_policy == "H2":
-                score = score_fairness_gated(urgency, 0.5, locality, reactive_prediction)
+                # H2 fairness-gated: once fairness urgency exceeds threshold,
+                # fairness dominates; below threshold locality/prediction blend.
+                # Fix: adapt locality weight by fairness debt so fairness can
+                # suppress locality dominance and avoid sticky loop to instance 0.
+                beta_h2 = adaptive_locality_weight(
+                    base_beta=1.0,
+                    fairness_debt_value=debt,
+                    lambda_d=1.0,
+                )
+                score = score_fairness_gated(urgency, 0.5, locality, reactive_prediction, beta=beta_h2)
                 prediction = reactive_prediction
             elif self.routing_policy == "H3":
                 score = score_aflc(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0, debt)
@@ -221,11 +253,94 @@ class Router:
                 )
                 prediction = predictive
 
-            candidates.append((index, score, safe, hit, locality, prediction))
+            candidates.append({
+                "index": index,
+                "safe": safe,
+                "hit": hit,
+                "locality": locality,
+                "prediction": prediction,
+                "load": load,
+                "risk": risk,
+                "capacity": capacity,
+                "queue": predicted_queue,
+            })
 
-        safe_candidates = [candidate for candidate in candidates if candidate[2]]
-        selected = max(safe_candidates or candidates, key=lambda candidate: (candidate[1], -candidate[0]))
-        return selected[0], selected[1], (debt, urgency, selected[4], selected[5], selected[3])
+        # Normalize candidate-dependent features once. Every policy below then
+        # operates on comparable [0, 1] benefits instead of raw queue/token units.
+        locality_values = normalize_candidates([c["locality"] for c in candidates])
+        prediction_values = normalize_candidates([c["prediction"] for c in candidates])
+        load_values = normalize_candidates([c["load"] for c in candidates], higher_is_better=False)
+        fairness_value = 0.5 + 0.5 * min(1.0, max(0.0, debt))
+
+        for index, candidate in enumerate(candidates):
+            locality = locality_values[index]
+            prediction = prediction_values[index]
+            normalized_load_benefit = load_values[index]
+            components = {
+                "F": fairness_value,
+                "L": locality,
+                "P": prediction,
+            }
+            combination_args = {
+                "fairness": fairness_value,
+                "locality": locality,
+                "prediction": prediction,
+            }
+            policy = self.routing_policy
+            if policy == "FAIRNESS":
+                score = score_combination(**combination_args, components="F")
+            elif policy == "LOCALITY":
+                score = score_combination(**combination_args, components="L")
+            elif policy == "PREDICTION":
+                score = score_combination(**combination_args, components="P")
+            elif policy in {"F_L", "L_P", "F_P", "F_L_P"}:
+                score = score_combination(**combination_args, components=policy.replace("_", ""))
+            elif policy == "PREBLE":
+                score = score_preble(candidate["load"], candidate["risk"], 1.0)
+            elif policy == "LBGR":
+                score = score_lbgr(candidate["hit"], req_data["input_toks"], req_data["output_toks"])
+            elif policy == "DUALMAP":
+                score = score_dualmap(candidate["queue"], 1.0 - locality)
+            elif policy == "CACHE_ROUTE":
+                score = score_cache_route(1.0, max(1.0, candidate["capacity"]), candidate["load"])
+            elif policy == "VTC":
+                score = score_vtc(self.fairness_tracker.get_service(client_id), req_data["input_toks"])
+            elif policy == "EQUINOX":
+                score = score_equinox(debt, candidate["load"])
+            elif policy == "QUARTZ":
+                score = score_quartz(candidate["queue"], 0.0, debt)
+            elif policy == "ISJL":
+                score = score_combination(**combination_args, components="F") - candidate["queue"] * 0.01
+            elif policy == "NEXUSSCHED":
+                score = score_nexussched(1.0 + candidate["queue"],
+                                         req_data["input_toks"] + req_data["output_toks"])
+            elif policy == "BALANCEROUTE":
+                score = score_balance_route(normalized_load_benefit, candidate["queue"])
+            elif policy == "PILLM":
+                score = score_pillm(req_data["input_toks"], candidate["queue"], req_data["output_toks"])
+            elif policy == "ONLINE_LP":
+                score = score_online_lp(normalized_load_benefit, candidate["queue"], 1.0)
+            elif policy == "H0":
+                score = score_linear(fairness_value, locality, prediction, 1.0, 1.0, 1.0)
+            elif policy == "H1":
+                score = score_multiplicative(fairness_value, locality, prediction, 1.0, 1.0, 1.0)
+            elif policy == "H2":
+                beta_h2 = adaptive_locality_weight(1.0, debt, 1.0)
+                score = score_fairness_gated(fairness_value, 0.5, locality, prediction, beta=beta_h2)
+            elif policy == "H3":
+                score = score_aflc(fairness_value, locality, prediction, 1.0, 1.0, 1.0, debt)
+            else:
+                score = score_combination(**combination_args, components="FLP")
+            candidate["score"] = score
+
+        safe_candidates = [candidate for candidate in candidates if candidate["safe"]]
+        pool = safe_candidates or candidates
+        sorted_candidates = sorted(pool, key=lambda candidate: (candidate["score"], -candidate["index"]), reverse=True)
+        selected = sorted_candidates[0]
+        margin = (selected["score"] - sorted_candidates[1]["score"]) if len(sorted_candidates) > 1 else 0.0
+        return selected["index"], selected["score"], (
+            debt, urgency, selected["locality"], selected["prediction"], selected["hit"], margin
+        )
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -366,7 +481,8 @@ class Router:
              new_req.routing_fairness_urgency,
              new_req.routing_locality,
              new_req.routing_prediction,
-             _) = route_metrics
+             _,
+             new_req.routing_score_margin) = route_metrics if len(route_metrics) >= 6 else (*route_metrics, 0.0)[:6]
             self._request_clients[new_req.id] = new_req.client_id
             self._request_service[new_req.id] = new_req.output - new_req.input
 

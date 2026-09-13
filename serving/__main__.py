@@ -29,7 +29,10 @@ from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
 import sys as flush
 
-from pyinstrument import Profiler
+try:
+    from pyinstrument import Profiler
+except ImportError:
+    Profiler = None
 
 
 def _pad_batch_to_max(batch, max_len):
@@ -278,11 +281,17 @@ def main():
                         '``torch_dtype`` (falling back to bfloat16). Overrides only take effect if the profiler '
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
     parser.add_argument('--request-routing-policy', type=str,
-                        choices=['LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'FAIRROUTE', 'CUSTOM'],
+                        choices=[
+                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'FAIRROUTE',
+                            'FAIRNESS', 'LOCALITY', 'PREDICTION', 'F_L', 'L_P', 'F_P', 'F_L_P',
+                            'PREBLE', 'LBGR', 'DUALMAP', 'CACHE_ROUTE', 'VTC', 'EQUINOX',
+                            'QUARTZ', 'ISJL', 'NEXUSSCHED', 'BALANCEROUTE', 'PILLM', 'ONLINE_LP',
+                            'CUSTOM',
+                        ],
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), H0-H4 (FairRoute hypotheses), '
-                        'FAIRROUTE (H4), CUSTOM (user-defined)')
+                        'FAIRROUTE, feature combinations, and literature policies (CUSTOM is user-defined)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -581,6 +590,19 @@ def main():
         for i in range(16):
             for sched in schedulers:
                 sched.add_request([i, sched.model, 64, 128, 0, i % num_instances])
+
+    ts_output_file = None
+    if output_file is not None:
+        target_path = output_file if os.path.isabs(output_file) else f"../{output_file}"
+        ts_output_file = target_path.replace('.csv', '_timeseries.csv')
+        os.makedirs(os.path.dirname(ts_output_file), exist_ok=True)
+        with open(ts_output_file, 'w', newline='') as ts_f:
+            ts_writer = csv.writer(ts_f)
+            ts_writer.writerow([
+                'timestamp_ns', 'timestamp_s', 'instance_id', 'running_reqs', 'waiting_reqs',
+                'npu_used_mb', 'npu_util_pct', 'kv_used_blocks', 'kv_num_blocks', 'kv_util_pct',
+                'prompt_th_toks_per_s', 'gen_th_toks_per_s'
+            ])
 
     # Simulator start
     current = 0 # current tick of the system
@@ -1030,6 +1052,19 @@ def main():
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.format_prefix_info()
                 print_markup(line)
+
+                if ts_output_file is not None:
+                    pool = getattr(mem, 'npu_pool', None)
+                    used_b = getattr(pool, 'used_blocks', 0) if pool else 0
+                    total_b = getattr(pool, 'num_blocks', 0) if pool else 0
+                    kv_util = (used_b / total_b * 100.0) if total_b else 0.0
+                    with open(ts_output_file, 'a', newline='') as ts_f:
+                        ts_writer = csv.writer(ts_f)
+                        ts_writer.writerow([
+                            current, f"{current / FREQ:.3f}", inst_id, running_reqs, waiting_reqs,
+                            f"{npu_used_mb:.2f}", f"{npu_util:.3f}", used_b, total_b, f"{kv_util:.3f}",
+                            f"{prompt_th * RATIO:.1f}", f"{gen_th * RATIO:.1f}"
+                        ])
 
             ######### Per Node Metrics #########
             if node2inst_mapping:

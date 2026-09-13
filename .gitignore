@@ -27,3 +27,9 @@ astra-sim/inputs/runs/
 .copilot/
 .aider*
 .continue/
+
+# Ignore VSCode settings
+.vscode/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/

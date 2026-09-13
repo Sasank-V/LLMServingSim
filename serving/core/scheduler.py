@@ -551,7 +551,9 @@ class Scheduler:
                     'instance id', 'request id', 'client id', 'model', 'input', 'output',
                     'arrival', 'end_time', 'latency', 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
                     'routing policy', 'fairness debt', 'fairness urgency',
-                    'locality', 'prediction', 'routing score'
+                    'locality', 'prediction', 'routing score', 'routing score margin',
+                    'prefix_cache_hit', 'npu_cache_hit', 'storage_cache_hit',
+                    'recompute_tokens', 'num_preemptions'
                 ])
             
             # Write each request's information
@@ -576,6 +578,12 @@ class Scheduler:
                     getattr(req, 'routing_locality', 0.0),
                     getattr(req, 'routing_prediction', 0.0),
                     getattr(req, 'routing_score', 0.0),
+                    getattr(req, 'routing_score_margin', 0.0),
+                    getattr(req, 'prefix_cache_hit', 0),
+                    getattr(req, 'npu_cache_hit', 0),
+                    getattr(req, 'storage_cache_hit', 0),
+                    max(0, req.original_input - getattr(req, 'prefix_cache_hit', 0)),
+                    getattr(req, 'num_preemptions', 0),
                 ])
 
 
