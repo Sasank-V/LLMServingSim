@@ -254,3 +254,34 @@ def fairroute_score(
         fairness_debt_value=fairness_debt_value,
         lambda_d=lambda_d,
     )
+
+
+def score_fairroute_v2(
+    debt: float,
+    urgency: float,
+    locality: float,
+    prediction: float,
+    normalized_load_benefit: float,
+    w_f_base: float = 1.0,
+    w_l: float = 1.0,
+    w_p: float = 1.0,
+) -> float:
+    """FairRoute-v2 (H5): deficit-driven adaptive weighted scoring.
+
+    Every component genuinely varies across candidates:
+    - fairness_benefit = urgency * (1 - load) = urgency * load_headroom
+      An underserved client (high urgency) is steered toward the least-loaded
+      replica; a well-served client lets locality/prediction dominate.
+    - locality: normalized prefix-cache hit ratio per candidate
+    - prediction: normalized inverse load per candidate
+
+    Weights adapt with debt: w_f = w_f_base + 2 * debt, so underserved clients
+    get progressively stronger fairness pull.
+    """
+    w_f = w_f_base + 2.0 * max(0.0, debt)
+    fairness_benefit = urgency * normalized_load_benefit
+    return (
+        w_f * fairness_benefit
+        + w_l * locality
+        + w_p * prediction
+    )

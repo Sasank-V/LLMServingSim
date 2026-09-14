@@ -5,6 +5,8 @@ class FairnessTracker:
 
     def __init__(self):
         self.service = {}
+        self.latency = {}
+        self.latency_count = {}
 
     def record_service(
         self,
@@ -25,6 +27,57 @@ class FairnessTracker:
             client_id,
             0.0
         )
+
+    def record_latency(
+        self,
+        client_id,
+        latency_ns,
+    ):
+        self.latency[client_id] = (
+            self.latency.get(client_id, 0.0)
+            + latency_ns
+        )
+        self.latency_count[client_id] = (
+            self.latency_count.get(client_id, 0)
+            + 1
+        )
+
+    def get_mean_latency(
+        self,
+        client_id,
+    ) -> float:
+
+        count = self.latency_count.get(client_id, 0)
+        if count <= 0:
+            return 0.0
+
+        return self.latency.get(
+            client_id,
+            0.0
+        ) / count
+
+    def jains_index_latency(self) -> float:
+        clients = [
+            client_id
+            for client_id, count in self.latency_count.items()
+            if count > 0
+        ]
+        n = len(clients)
+        if n < 2:
+            return 1.0
+
+        means = [
+            self.get_mean_latency(client_id)
+            for client_id in clients
+        ]
+        sum_x = sum(means)
+        sum_sq = sum(x * x for x in means)
+
+        denom = n * sum_sq
+        if denom == 0.0:
+            return 1.0
+
+        return (sum_x ** 2) / denom
 
 def fairness_target(
     total_service: float,

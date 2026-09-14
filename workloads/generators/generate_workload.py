@@ -16,34 +16,22 @@ This matches the "flat requests" format documented in:
   https://github.com/casys-kaist/LLMServingSim/blob/main/workloads/README.md
 
 Usage:
-  pip install datasets transformers numpy
+  pip install datasets transformers numpy tqdm
   python generate_workload.py \
       --num-reqs 500 \
       --sps 10.0 \
       --output workload-llama8b-500-sps10.jsonl
-Optional flags:
-  --seed              RNG seed (default: 42)
-  --max-sessions      Cap on HF rows to load (default: 5000)
-  --min-input-toks    Minimum input token count (default: 4)
-  --max-input-toks    Maximum input token count (default: 8192)
-  --min-output-toks   Minimum output token count (default: 1)
-  --max-output-toks   Maximum output token count (default: 8192)
-  --max-kv-toks       Maximum input+output combined (default: 8192)
-  --first-arrival-sec Offset (seconds) for first arrival (default: 0)
-  --add-client-ids    Add a "client_id" field with Zipfian skew
-  --num-clients       Number of synthetic clients (default: 5)
-  --zipf-alpha        Zipfian skew parameter (default: 1.1)
-    --client-distribution  Client assignment: zipf or balanced (default: zipf)
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -55,23 +43,48 @@ from tqdm import tqdm
 
 DATASET_ID = "nebius/Llama-3.1-8B-Instruct-Infinity-Instruct-0625"
 MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
-
 NS_PER_SEC = 1_000_000_000
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset & Turn Extraction
 # ---------------------------------------------------------------------------
 
 
-def load_dataset_rows(
-    max_sessions: int,
-    seed: int,
-    dataset_dir: str = "./nebius_dataset_cache",
-    hf_token: str | None = None,
-) -> list[dict]:
-    """Load rows from local disk cache if present, else download from HF and save locally."""
-    from datasets import load_dataset, load_from_disk
+def extract_turn_from_row(row: dict) -> tuple[str, str] | None:
+    """Extract (input_text, output_text) pair from a single dataset row."""
+    conversation = row.get("conversation", [])
+    generated = row.get("generated_message", {})
+    output_text = generated.get("content", "")
+    finish_reason = row.get("finish_reason", "")
+
+    if not output_text or not output_text.strip():
+        return None
+    if finish_reason != "stop":
+        return None
+
+    input_parts: list[str] = []
+    for msg in conversation:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            input_parts.append(
+                f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+            )
+
+    if not input_parts:
+        return None
+
+    input_text = (
+        "<|begin_of_text|>"
+        + "".join(input_parts)
+        + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+    return input_text, output_text
+
+
+def load_dataset(dataset_dir: str, hf_token: str | None = None):
+    from datasets import load_dataset as hf_load_dataset, load_from_disk
 
     cache_path = Path(dataset_dir)
     kwargs = {}
@@ -80,85 +93,15 @@ def load_dataset_rows(
 
     if cache_path.exists() and (cache_path / "dataset_info.json").exists():
         print(f"Loading local dataset from: {cache_path} ...")
-        ds = load_from_disk(str(cache_path))
+        return load_from_disk(str(cache_path))
     else:
         print(f"Downloading dataset from HuggingFace ({DATASET_ID}) ...")
-        ds = load_dataset(DATASET_ID, split="train", **kwargs)
+        ds = hf_load_dataset(DATASET_ID, split="train", **kwargs)
         print(f"Saving dataset locally to: {cache_path} (for future offline runs) ...")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         ds.save_to_disk(str(cache_path))
         print("  Dataset saved locally.")
-
-    total_rows = len(ds)
-    limit = min(max_sessions, total_rows) if max_sessions > 0 else total_rows
-
-    rows: list[dict] = []
-    pbar = tqdm(total=limit, desc="Loading dataset rows", unit="row")
-    for i, row in enumerate(ds):
-        if max_sessions > 0 and i >= max_sessions:
-            break
-        rows.append(row)
-        pbar.update(1)
-    pbar.close()
-
-    print(f"  Loaded {len(rows)} rows.")
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Conversation -> (input_text, output_text) extraction
-# ---------------------------------------------------------------------------
-
-
-def extract_turns(rows: list[dict]) -> list[tuple[str, str]]:
-    """
-    Extract (input_text, output_text) pairs from the dataset.
-
-    For single-turn rows: input = conversation[0].content,
-                          output = generated_message.content.
-
-    For multi-turn rows: input = all prior turns concatenated
-                         (preserving shared-prefix structure),
-                         output = generated_message.content.
-    """
-    turns: list[tuple[str, str]] = []
-
-    for row in rows:
-        conversation = row.get("conversation", [])
-        generated = row.get("generated_message", {})
-        output_text = generated.get("content", "")
-        finish_reason = row.get("finish_reason", "")
-
-        # Skip rows with empty output or non-stop finishes
-        if not output_text or not output_text.strip():
-            continue
-        if finish_reason != "stop":
-            continue
-
-        # Build the full input text from the conversation history.
-        # This uses Llama-3.1-Instruct chat template tokens so the
-        # tokenizer produces the same IDs as a real serving request.
-        input_parts: list[str] = []
-        for msg in conversation:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if content:
-                input_parts.append(
-                    f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
-                )
-
-        if not input_parts:
-            continue
-
-        # The full prompt includes the conversation + assistant header
-        input_text = (
-            "<|begin_of_text|>"
-            + "".join(input_parts)
-            + "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        )
-        turns.append((input_text, output_text))
-
-    return turns
+        return ds
 
 
 # ---------------------------------------------------------------------------
@@ -166,41 +109,13 @@ def extract_turns(rows: list[dict]) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-def tokenize_turns(
-    turns: list[tuple[str, str]],
-    min_input: int,
-    max_input: int,
-    min_output: int,
-    max_output: int,
-    max_kv: int,
-    tokenizer_dir: str = "./llama_tokenizer_cache",
-    hf_token: str | None = None,
-    checkpoint_file: str | None = None,
-    checkpoint_interval: int = 10,
-    num_workers: int = 0,
-    load_results: bool = True,
-) -> list[dict[str, Any]]:
-    """
-    Tokenize (input_text, output_text) pairs using the Llama-3.1-8B
-    tokenizer and filter by length constraints.
-
-    Returns a list of dicts with:
-      - input_tok_ids: list[int]
-      - output_tok_ids: list[int]
-      - input_toks: int
-      - output_toks: int
-    """
+def get_tokenizer(tokenizer_dir: str, hf_token: str | None = None):
     from transformers import AutoTokenizer
-
-    if checkpoint_interval < 1:
-        raise ValueError("checkpoint_interval must be at least 1")
-    if num_workers < 0:
-        raise ValueError("num_workers cannot be negative")
 
     tok_path = Path(tokenizer_dir)
     if tok_path.exists() and (tok_path / "tokenizer_config.json").exists():
         print(f"Loading local tokenizer from: {tok_path} ...")
-        tokenizer = AutoTokenizer.from_pretrained(str(tok_path))
+        return AutoTokenizer.from_pretrained(str(tok_path))
     else:
         print(f"Loading tokenizer from HuggingFace ({MODEL_ID}) ...")
         kwargs = {}
@@ -210,145 +125,42 @@ def tokenize_turns(
         print(f"Saving tokenizer locally to: {tok_path} (for future offline runs) ...")
         tok_path.mkdir(parents=True, exist_ok=True)
         tokenizer.save_pretrained(str(tok_path))
+        return tokenizer
 
-    print(f"  Vocab size: {tokenizer.vocab_size}")
 
-    checkpoint_path = Path(checkpoint_file) if checkpoint_file else None
-    checkpoint_config = {
-        "tokenizer_dir": str(tok_path),
-        "min_input": min_input,
-        "max_input": max_input,
-        "min_output": min_output,
-        "max_output": max_output,
-        "max_kv": max_kv,
-        "turn_count": len(turns),
-    }
+def tokenize_turn(
+    turn: tuple[str, str],
+    tokenizer: Any,
+    min_input: int,
+    max_input: int,
+    min_output: int,
+    max_output: int,
+    max_kv: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    input_text, output_text = turn
+    input_ids = tokenizer.encode(input_text, add_special_tokens=False)
+    output_ids = tokenizer.encode(output_text, add_special_tokens=False)
 
-    start_index = 0
-    checkpoint_handle = None
-    if checkpoint_path and checkpoint_path.exists():
-        print(f"Loading tokenization checkpoint from: {checkpoint_path} ...")
-        with checkpoint_path.open("rb+") as checkpoint_input:
-            header = json.loads(checkpoint_input.readline())
-            if header.get("config") != checkpoint_config:
-                raise ValueError(
-                    "Checkpoint settings do not match this run. "
-                    f"Delete {checkpoint_path} to start over."
-                )
-            last_valid_offset = checkpoint_input.tell()
-            while line := checkpoint_input.readline():
-                if not line.endswith(b"\n"):
-                    checkpoint_input.seek(last_valid_offset)
-                    checkpoint_input.truncate()
-                    break
-                record = json.loads(line)
-                if record["index"] != start_index:
-                    raise ValueError(
-                        f"Invalid tokenization checkpoint: {checkpoint_path}"
-                    )
-                start_index += 1
-                last_valid_offset = checkpoint_input.tell()
-        print(f"  Resuming after {start_index}/{len(turns)} conversions.")
+    n_in = len(input_ids)
+    n_out = len(output_ids)
 
-    if checkpoint_path:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint_handle = checkpoint_path.open("a")
-        if start_index == 0:
-            checkpoint_handle.write(json.dumps({"config": checkpoint_config}) + "\n")
-            checkpoint_handle.flush()
+    if n_in < min_input:
+        return None, "short_input"
+    if n_in > max_input:
+        return None, "long_input"
+    if n_out < min_output:
+        return None, "short_output"
+    if n_out > max_output:
+        return None, "long_output"
+    if n_in + n_out > max_kv:
+        return None, "kv_overflow"
 
-    skipped_short_input = 0
-    skipped_long_input = 0
-    skipped_short_output = 0
-    skipped_long_output = 0
-    skipped_kv = 0
-
-    def convert_turn(turn: tuple[str, str]) -> tuple[dict[str, Any] | None, str | None]:
-        input_text, output_text = turn
-        input_ids = tokenizer.encode(input_text, add_special_tokens=False)
-        output_ids = tokenizer.encode(output_text, add_special_tokens=False)
-
-        n_in = len(input_ids)
-        n_out = len(output_ids)
-
-        if n_in < min_input:
-            return None, "short_input"
-        if n_in > max_input:
-            return None, "long_input"
-        if n_out < min_output:
-            return None, "short_output"
-        if n_out > max_output:
-            return None, "long_output"
-        if n_in + n_out > max_kv:
-            return None, "kv_overflow"
-
-        return {
-            "input_tok_ids": input_ids,
-            "output_tok_ids": output_ids,
-            "input_toks": n_in,
-            "output_toks": n_out,
-        }, None
-
-    workers = num_workers or min(32, (os.cpu_count() or 1) + 4)
-    batch_size = max(checkpoint_interval, checkpoint_interval * workers)
-    remaining = turns[start_index:]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        progress = tqdm(
-            total=len(turns),
-            initial=start_index,
-            desc="Tokenizing & filtering turns",
-            unit="turn",
-        )
-        for batch_start in range(0, len(remaining), batch_size):
-            batch = remaining[batch_start : batch_start + batch_size]
-            batch_results = list(executor.map(convert_turn, batch))
-            for offset, (result, skip_reason) in enumerate(batch_results):
-                index = start_index + batch_start + offset
-                if skip_reason == "short_input":
-                    skipped_short_input += 1
-                elif skip_reason == "long_input":
-                    skipped_long_input += 1
-                elif skip_reason == "short_output":
-                    skipped_short_output += 1
-                elif skip_reason == "long_output":
-                    skipped_long_output += 1
-                elif skip_reason == "kv_overflow":
-                    skipped_kv += 1
-                if checkpoint_handle:
-                    checkpoint_handle.write(
-                        json.dumps({"index": index, "result": result}) + "\n"
-                    )
-                progress.update(1)
-            if checkpoint_handle:
-                checkpoint_handle.flush()
-            del batch_results
-            del batch
-        progress.close()
-    if checkpoint_handle:
-        checkpoint_handle.close()
-
-    if not checkpoint_path:
-        raise ValueError("checkpoint_file is required for resumable tokenization")
-    if not load_results:
-        return []
-
-    valid_results: list[dict[str, Any]] = []
-    with checkpoint_path.open() as checkpoint_input:
-        next(checkpoint_input)
-        for line in checkpoint_input:
-            result = json.loads(line)["result"]
-            if result is not None:
-                valid_results.append(result)
-    print(f"  Tokenized {len(valid_results)} valid turns from {len(turns)} total.")
-    print(
-        f"  Skipped: short_input={skipped_short_input}, "
-        f"long_input={skipped_long_input}, "
-        f"short_output={skipped_short_output}, "
-        f"long_output={skipped_long_output}, "
-        f"kv_overflow={skipped_kv}"
-    )
-
-    return valid_results
+    return {
+        "input_tok_ids": input_ids,
+        "output_tok_ids": output_ids,
+        "input_toks": n_in,
+        "output_toks": n_out,
+    }, None
 
 
 # ---------------------------------------------------------------------------
@@ -362,35 +174,14 @@ def generate_arrival_times(
     first_arrival_sec: float,
     rng: np.random.Generator,
 ) -> list[int]:
-    """
-    Generate Poisson-distributed arrival times in nanoseconds.
-
-    Args:
-        num_reqs: Number of requests to generate arrivals for.
-        sps: Arrival rate in requests per second.
-        first_arrival_sec: Offset (seconds) for the first arrival.
-        rng: NumPy random generator.
-
-    Returns:
-        Sorted list of arrival times in nanoseconds.
-    """
-    # Inter-arrival times are exponentially distributed with rate = sps
     inter_arrivals = rng.exponential(scale=1.0 / sps, size=num_reqs)
-
-    # Convert to cumulative arrival times
-    arrival_times_sec = np.cumsum(inter_arrivals)
-
-    # Add the first-arrival offset
-    arrival_times_sec += first_arrival_sec
-
-    # Convert to nanoseconds (int64 to match LLMServingSim format)
+    arrival_times_sec = np.cumsum(inter_arrivals) + first_arrival_sec
     arrival_times_ns = (arrival_times_sec * NS_PER_SEC).astype(np.int64)
-
     return arrival_times_ns.tolist()
 
 
 # ---------------------------------------------------------------------------
-# Client ID assignment (Zipfian distribution for fairness experiments)
+# Client ID assignment (Zipfian distribution)
 # ---------------------------------------------------------------------------
 
 
@@ -401,19 +192,6 @@ def assign_client_ids(
     rng: np.random.Generator,
     distribution: str = "zipf",
 ) -> list[int]:
-    """
-    Assign client IDs following a Zipfian distribution.
-    Client 0 sends the most requests, Client num_clients-1 the fewest.
-
-    Args:
-        num_reqs: Number of requests.
-        num_clients: Number of synthetic clients.
-        zipf_alpha: Zipfian skew parameter (>1 = more skewed).
-        rng: NumPy random generator.
-
-    Returns:
-        List of client IDs (0-indexed), one per request.
-    """
     if num_clients <= 0:
         raise ValueError("num_clients must be positive")
     if distribution == "balanced":
@@ -423,95 +201,131 @@ def assign_client_ids(
     if distribution != "zipf":
         raise ValueError(f"unknown client distribution: {distribution}")
 
-    # Compute Zipfian weights: rank-1 gets highest probability
     ranks = np.arange(1, num_clients + 1, dtype=np.float64)
     weights = 1.0 / np.power(ranks, zipf_alpha)
     probabilities = weights / weights.sum()
-
-    # Sample client IDs
     client_ids = rng.choice(num_clients, size=num_reqs, p=probabilities)
     return client_ids.tolist()
 
 
 # ---------------------------------------------------------------------------
-# Main generation logic
+# Main generation logic (Streamed & O(1) Memory)
 # ---------------------------------------------------------------------------
 
 
 def generate_workload(args: argparse.Namespace) -> None:
-    """Generate the LLMServingSim-compatible workload JSONL file."""
     rng = np.random.default_rng(args.seed)
 
     # ── Step 1: Load dataset ──────────────────────────────────────────
-    rows = load_dataset_rows(
-        args.max_sessions,
-        args.seed,
-        dataset_dir=args.dataset_dir,
-        hf_token=args.hf_token,
+    ds = load_dataset(args.dataset_dir, hf_token=args.hf_token)
+    total_rows = len(ds)
+    limit = min(args.max_sessions, total_rows) if args.max_sessions > 0 else total_rows
+    print(f"Processing up to {limit} dataset rows...")
+
+    # ── Step 2: Tokenize & Checkpoint in Streaming Batches ─────────────
+    tokenizer = get_tokenizer(args.tokenizer_dir, hf_token=args.hf_token)
+    checkpoint_path = Path(
+        args.checkpoint_file or f"{args.output}.tokenize.checkpoint.jsonl"
     )
 
-    # ── Step 2: Extract turns ─────────────────────────────────────────
-    turns = extract_turns(rows)
-    print(f"  Extracted {len(turns)} conversation turns.")
+    checkpoint_config = {
+        "tokenizer_dir": str(args.tokenizer_dir),
+        "min_input": args.min_input_toks,
+        "max_input": args.max_input_toks,
+        "min_output": args.min_output_toks,
+        "max_output": args.max_output_toks,
+        "max_kv": args.max_kv_toks,
+        "limit": limit,
+    }
 
-    if len(turns) == 0:
-        print(
-            "ERROR: No valid turns extracted. Check dataset format.",
-            file=sys.stderr,
-        )
+    start_index = 0
+    valid_count = 0
+    if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+        print(f"Checking existing tokenization checkpoint: {checkpoint_path} ...")
+        with checkpoint_path.open("r", encoding="utf-8") as chk_in:
+            _header = chk_in.readline()
+            for line in chk_in:
+                if not line.strip():
+                    continue
+                start_index += 1
+                try:
+                    rec = json.loads(line)
+                    if rec.get("result") is not None:
+                        valid_count += 1
+                except json.JSONDecodeError:
+                    break
+        print(f"  Resuming from turn index {start_index}/{limit} ({valid_count} valid turns found).")
+
+    if start_index < limit:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not checkpoint_path.exists() or checkpoint_path.stat().st_size == 0
+        chk_handle = checkpoint_path.open("a", encoding="utf-8")
+        if is_new:
+            chk_handle.write(json.dumps({"config": checkpoint_config}) + "\n")
+            chk_handle.flush()
+
+        workers = args.num_workers or min(32, (os.cpu_count() or 1) + 4)
+        batch_size = max(args.checkpoint_interval, args.checkpoint_interval * workers)
+        print(f"Tokenizing remaining {limit - start_index} turns using {workers} workers...")
+
+        pbar = tqdm(total=limit, initial=start_index, desc="Tokenizing turns", unit="turn")
+
+        def process_row_idx(idx: int):
+            row = ds[idx]
+            turn = extract_turn_from_row(row)
+            if turn is None:
+                return idx, None, "extract_failed"
+            res, reason = tokenize_turn(
+                turn,
+                tokenizer,
+                args.min_input_toks,
+                args.max_input_toks,
+                args.min_output_toks,
+                args.max_output_toks,
+                args.max_kv_toks,
+            )
+            return idx, res, reason
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for b_start in range(start_index, limit, batch_size):
+                b_end = min(limit, b_start + batch_size)
+                batch_indices = range(b_start, b_end)
+                batch_results = list(executor.map(process_row_idx, batch_indices))
+
+                for idx, res, _reason in batch_results:
+                    chk_handle.write(json.dumps({"index": idx, "result": res}) + "\n")
+                    if res is not None:
+                        valid_count += 1
+                    pbar.update(1)
+                chk_handle.flush()
+                del batch_results
+        pbar.close()
+        chk_handle.close()
+
+    print(f"Tokenization complete: {valid_count} valid turns available.")
+
+    if valid_count == 0:
+        print("ERROR: No turns passed length filters.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Step 3: Tokenize and filter ───────────────────────────────────
-    tokenized = tokenize_turns(
-        turns,
-        min_input=args.min_input_toks,
-        max_input=args.max_input_toks,
-        min_output=args.min_output_toks,
-        max_output=args.max_output_toks,
-        max_kv=args.max_kv_toks,
-        tokenizer_dir=args.tokenizer_dir,
-        hf_token=args.hf_token,
-        checkpoint_file=args.checkpoint_file
-        or f"{args.output}.tokenize.checkpoint.jsonl",
-        checkpoint_interval=args.checkpoint_interval,
-        num_workers=args.num_workers,
-    )
-    del rows
-    del turns
-
-    if len(tokenized) == 0:
-        print(
-            "ERROR: No turns passed the length filters. Relax the constraints.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # ── Step 4: Select requests ────────────────────────────────────────
+    # ── Step 3: Select requests ────────────────────────────────────────
     if args.use_all:
-        # Use every row that survived filtering — no sampling
-        selected = tokenized
-        num_reqs = len(selected)
+        num_reqs = valid_count
+        selected_counts = None
         print(f"  --use-all: emitting all {num_reqs} valid turns.")
     else:
         num_reqs = args.num_reqs
         if num_reqs is None:
-            print(
-                "ERROR: Specify --num-reqs N or --use-all.",
-                file=sys.stderr,
-            )
+            print("ERROR: Specify --num-reqs N or --use-all.", file=sys.stderr)
             sys.exit(1)
-        if len(tokenized) >= num_reqs:
-            indices = rng.choice(len(tokenized), size=num_reqs, replace=False)
+        if valid_count >= num_reqs:
+            indices = rng.choice(valid_count, size=num_reqs, replace=False)
         else:
-            print(
-                f"  WARNING: Only {len(tokenized)} valid turns "
-                f"available, but {num_reqs} requested. "
-                f"Sampling with replacement."
-            )
-            indices = rng.choice(len(tokenized), size=num_reqs, replace=True)
-        selected = [tokenized[i] for i in indices]
+            print(f"  WARNING: Only {valid_count} valid turns available, but {num_reqs} requested. Sampling with replacement.")
+            indices = rng.choice(valid_count, size=num_reqs, replace=True)
+        selected_counts = Counter(indices)
 
-    # ── Step 5: Generate Poisson arrival times ────────────────────────
+    # ── Step 4: Generate Arrival Times & Client IDs ────────────────────
     arrival_times = generate_arrival_times(
         num_reqs=num_reqs,
         sps=args.sps,
@@ -519,7 +333,6 @@ def generate_workload(args: argparse.Namespace) -> None:
         rng=rng,
     )
 
-    # ── Step 6: Optionally assign client IDs ──────────────────────────
     client_ids = None
     if args.add_client_ids:
         client_ids = assign_client_ids(
@@ -529,60 +342,91 @@ def generate_workload(args: argparse.Namespace) -> None:
             rng=rng,
             distribution=args.client_distribution,
         )
-    # ── Step 7: Write JSONL ───────────────────────────────────────────
+
+    # ── Step 5: Write Output JSONL (Streamed) ─────────────────────────
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    input_lens = [s["input_toks"] for s in selected]
-    output_lens = [s["output_toks"] for s in selected]
 
-    with open(output_path, "w") as f:
-        for i in range(num_reqs):
-            record: dict[str, Any] = {
-                "input_toks": selected[i]["input_toks"],
-                "output_toks": selected[i]["output_toks"],
-                "arrival_time_ns": arrival_times[i],
-                "input_tok_ids": selected[i]["input_tok_ids"],
-                "output_tok_ids": selected[i]["output_tok_ids"],
-            }
-            # client_id is NOT part of the core LLMServingSim spec,
-            # but is included as metadata for FairRoute's fairness
-            # experiments. LLMServingSim ignores unknown fields.
-            if client_ids is not None:
-                record["client_id"] = client_ids[i]
+    input_lens: list[int] = []
+    output_lens: list[int] = []
 
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-            selected[i] = None
+    print(f"Writing {num_reqs} JSONL records to {output_path} ...")
+    with checkpoint_path.open("r", encoding="utf-8") as chk_file, open(
+        output_path, "w", encoding="utf-8"
+    ) as out_file:
+        _header = chk_file.readline()
+        valid_idx = 0
+        req_idx = 0
+        pbar = tqdm(total=num_reqs, desc="Writing JSONL output", unit="req")
 
-    # ── Summary statistics ────────────────────────────────────────────
-    del tokenized
-    total_duration_sec = arrival_times[-1] / NS_PER_SEC
+        for line in chk_file:
+            if req_idx >= num_reqs and args.use_all:
+                break
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            res = rec.get("result")
+            if res is None:
+                continue
+
+            repeat = 1
+            if selected_counts is not None:
+                repeat = selected_counts.get(valid_idx, 0)
+            valid_idx += 1
+
+            for _ in range(repeat):
+                if req_idx >= num_reqs:
+                    break
+                out_rec = {
+                    "input_toks": res["input_toks"],
+                    "output_toks": res["output_toks"],
+                    "arrival_time_ns": arrival_times[req_idx],
+                    "input_tok_ids": res["input_tok_ids"],
+                    "output_tok_ids": res["output_tok_ids"],
+                }
+                if client_ids is not None:
+                    out_rec["client_id"] = client_ids[req_idx]
+
+                out_file.write(json.dumps(out_rec, separators=(",", ":")) + "\n")
+                input_lens.append(res["input_toks"])
+                output_lens.append(res["output_toks"])
+                req_idx += 1
+                pbar.update(1)
+
+        pbar.close()
+
+    # ── Step 6: Summary Statistics ────────────────────────────────────
+    total_duration_sec = arrival_times[-1] / NS_PER_SEC if arrival_times else 0.0
 
     print(f"\n{'=' * 60}")
     print(f"  Output: {output_path}")
-    print(f"  Requests: {num_reqs}")
+    print(f"  Requests: {len(input_lens)}")
     print(f"  Arrival rate: {args.sps} req/s (Poisson)")
     print(f"  Total duration: {total_duration_sec:.1f} sec")
-    print(
-        f"  Input tokens:  min={min(input_lens)}, "
-        f"max={max(input_lens)}, "
-        f"mean={np.mean(input_lens):.0f}, "
-        f"median={np.median(input_lens):.0f}"
-    )
-    print(
-        f"  Output tokens: min={min(output_lens)}, "
-        f"max={max(output_lens)}, "
-        f"mean={np.mean(output_lens):.0f}, "
-        f"median={np.median(output_lens):.0f}"
-    )
+    if input_lens:
+        print(
+            f"  Input tokens:  min={min(input_lens)}, "
+            f"max={max(input_lens)}, "
+            f"mean={np.mean(input_lens):.0f}, "
+            f"median={np.median(input_lens):.0f}"
+        )
+        print(
+            f"  Output tokens: min={min(output_lens)}, "
+            f"max={max(output_lens)}, "
+            f"mean={np.mean(output_lens):.0f}, "
+            f"median={np.median(output_lens):.0f}"
+        )
     if client_ids is not None:
-        from collections import Counter
-
         counts = Counter(client_ids)
         print(
             f"  Client distribution ({args.client_distribution}, Zipf alpha={args.zipf_alpha}):"
         )
         for cid in sorted(counts.keys()):
-            pct = counts[cid] / num_reqs * 100
+            pct = counts[cid] / len(client_ids) * 100
             print(f"    Client {cid}: {counts[cid]} requests ({pct:.1f}%)")
     print(f"{'=' * 60}")
 
@@ -602,7 +446,6 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Required
     p.add_argument(
         "--num-reqs",
         type=int,
@@ -628,8 +471,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output JSONL file path.",
     )
-
-    # Optional
     p.add_argument(
         "--dataset-dir",
         type=str,
@@ -685,7 +526,6 @@ def parse_args() -> argparse.Namespace:
         help="Tokenizer worker threads (0 = choose automatically).",
     )
 
-    # Length filters
     p.add_argument(
         "--min-input-toks",
         type=int,
@@ -717,7 +557,6 @@ def parse_args() -> argparse.Namespace:
         help="Drop turns where input+output exceeds this.",
     )
 
-    # FairRoute client assignment
     client_id_group = p.add_mutually_exclusive_group()
     client_id_group.add_argument(
         "--add-client-ids",

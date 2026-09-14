@@ -282,7 +282,7 @@ def main():
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
     parser.add_argument('--request-routing-policy', type=str,
                         choices=[
-                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'FAIRROUTE',
+                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'H5', 'FAIRROUTE', 'FAIRROUTE_V2',
                             'FAIRNESS', 'LOCALITY', 'PREDICTION', 'F_L', 'L_P', 'F_P', 'F_L_P',
                             'PREBLE', 'LBGR', 'DUALMAP', 'CACHE_ROUTE', 'VTC', 'EQUINOX',
                             'QUARTZ', 'ISJL', 'NEXUSSCHED', 'BALANCEROUTE', 'PILLM', 'ONLINE_LP',
@@ -290,7 +290,7 @@ def main():
                         ],
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
-                        'RR (round-robin), RAND (random), H0-H4 (FairRoute hypotheses), '
+                        'RR (round-robin), RAND (random), H0-H5 (FairRoute hypotheses), '
                         'FAIRROUTE, feature combinations, and literature policies (CUSTOM is user-defined)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],

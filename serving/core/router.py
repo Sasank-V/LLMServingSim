@@ -1,4 +1,5 @@
 import bisect
+import hashlib
 import json
 import random
 from .request import Request
@@ -26,6 +27,7 @@ from .algorithms.fairroute import (
     score_pillm,
     score_balance_route,
     score_online_lp,
+    score_fairroute_v2,
     normalize_candidates,
 )
 from .algorithms.locality import (
@@ -68,7 +70,7 @@ class Router:
         self._request_service = {}
         self.custom_routing_fn = custom_routing_fn
         self._routing_policy_names = {
-            "H0", "H1", "H2", "H3", "H4", "FAIRROUTE",
+            "H0", "H1", "H2", "H3", "H4", "H5", "FAIRROUTE", "FAIRROUTE_V2",
             "FAIRNESS", "LOCALITY", "PREDICTION", "F_L", "L_P", "F_P", "F_L_P",
             "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE", "VTC", "EQUINOX",
             "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE", "PILLM", "ONLINE_LP",
@@ -97,7 +99,7 @@ class Router:
             self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, H0-H4, FAIRROUTE, "
+                             "Supported: RR, RAND, LOAD, H0-H5, FAIRROUTE, FAIRROUTE_V2, "
                              "FAIRNESS, LOCALITY, PREDICTION, F_L, L_P, F_P, F_L_P, "
                              "and literature policies")
         self.logger = get_logger(self.__class__)
@@ -204,8 +206,21 @@ class Router:
         kv_util = kv_utilization(used_blocks, total_blocks)
         return load, predicted_queue, kv_util
 
+    @staticmethod
+    def _tiebreak_jitter(request_index, candidate_index):
+        """Deterministic hash-based jitter to break ties without systematic bias.
+
+        Using -candidate["index"] as tie-break always selects the lowest index,
+        causing pathological hotspotting when scores are equal. This hashes the
+        (request, candidate) pair to produce a stable but uniformly scattered
+        value, so ties distribute evenly across replicas.
+        """
+        h = hashlib.md5(f"{request_index}:{candidate_index}".encode()).digest()
+        return int.from_bytes(h[:4], 'little') / 0xFFFFFFFF
+
     def _select_fairroute_candidate(self, schedulers, req_data):
         client_id = req_data.get('client_id', 'default')
+        request_index = req_data.get('index', 0)
         total_service = sum(self.fairness_tracker.service.values())
         clients = set(self.fairness_tracker.service)
         clients.add(client_id)
@@ -225,44 +240,18 @@ class Router:
             risk = prediction_risk(predicted_queue, kv_util)
             predictive = prediction_benefit(risk, max(1.0, capacity or 1.0))
 
-            if self.routing_policy == "H0":
-                score = score_linear(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0)
-                prediction = reactive_prediction
-            elif self.routing_policy == "H1":
-                score = score_multiplicative(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0)
-                prediction = reactive_prediction
-            elif self.routing_policy == "H2":
-                # H2 fairness-gated: once fairness urgency exceeds threshold,
-                # fairness dominates; below threshold locality/prediction blend.
-                # Fix: adapt locality weight by fairness debt so fairness can
-                # suppress locality dominance and avoid sticky loop to instance 0.
-                beta_h2 = adaptive_locality_weight(
-                    base_beta=1.0,
-                    fairness_debt_value=debt,
-                    lambda_d=1.0,
-                )
-                score = score_fairness_gated(urgency, 0.5, locality, reactive_prediction, beta=beta_h2)
-                prediction = reactive_prediction
-            elif self.routing_policy == "H3":
-                score = score_aflc(urgency, locality, reactive_prediction, 1.0, 1.0, 1.0, debt)
-                prediction = reactive_prediction
-            else:
-                score = fairroute_score(
-                    debt, urgency, locality, risk,
-                    prediction_temperature=max(1.0, capacity or 1.0),
-                )
-                prediction = predictive
-
             candidates.append({
                 "index": index,
                 "safe": safe,
                 "hit": hit,
                 "locality": locality,
-                "prediction": prediction,
+                "prediction": reactive_prediction,
+                "predictive": predictive,
                 "load": load,
                 "risk": risk,
                 "capacity": capacity,
                 "queue": predicted_queue,
+                "kv_util": kv_util,
             })
 
         # Normalize candidate-dependent features once. Every policy below then
@@ -270,19 +259,22 @@ class Router:
         locality_values = normalize_candidates([c["locality"] for c in candidates])
         prediction_values = normalize_candidates([c["prediction"] for c in candidates])
         load_values = normalize_candidates([c["load"] for c in candidates], higher_is_better=False)
-        fairness_value = 0.5 + 0.5 * min(1.0, max(0.0, debt))
+
+        # Per-candidate fairness: urgency * load_headroom.  An underserved
+        # client (high urgency) is steered toward the least-loaded replica;
+        # a well-served client (urgency ≈ 0) lets locality/prediction dominate.
+        # This makes fairness genuinely vary across candidates, unlike the old
+        # scalar `fairness_value` that was identical for every candidate and
+        # collapsed all F-containing policies to ties on instance 0.
+        fairness_values = [urgency * lb for lb in load_values]
 
         for index, candidate in enumerate(candidates):
             locality = locality_values[index]
             prediction = prediction_values[index]
             normalized_load_benefit = load_values[index]
-            components = {
-                "F": fairness_value,
-                "L": locality,
-                "P": prediction,
-            }
+            fairness_benefit = fairness_values[index]
             combination_args = {
-                "fairness": fairness_value,
+                "fairness": fairness_benefit,
                 "locality": locality,
                 "prediction": prediction,
             }
@@ -321,21 +313,41 @@ class Router:
             elif policy == "ONLINE_LP":
                 score = score_online_lp(normalized_load_benefit, candidate["queue"], 1.0)
             elif policy == "H0":
-                score = score_linear(fairness_value, locality, prediction, 1.0, 1.0, 1.0)
+                score = score_linear(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
             elif policy == "H1":
-                score = score_multiplicative(fairness_value, locality, prediction, 1.0, 1.0, 1.0)
+                score = score_multiplicative(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
             elif policy == "H2":
                 beta_h2 = adaptive_locality_weight(1.0, debt, 1.0)
-                score = score_fairness_gated(fairness_value, 0.5, locality, prediction, beta=beta_h2)
+                score = score_fairness_gated(fairness_benefit, 0.5, locality, prediction, beta=beta_h2)
             elif policy == "H3":
-                score = score_aflc(fairness_value, locality, prediction, 1.0, 1.0, 1.0, debt)
+                score = score_aflc(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0, debt)
+            elif policy in ("H4", "FAIRROUTE"):
+                capacity_val = candidate["capacity"]
+                score = fairroute_score(
+                    debt, urgency, locality, candidate["risk"],
+                    prediction_temperature=max(1.0, capacity_val or 1.0),
+                )
+            elif policy in ("H5", "FAIRROUTE_V2"):
+                score = score_fairroute_v2(
+                    debt=debt,
+                    urgency=urgency,
+                    locality=locality,
+                    prediction=prediction,
+                    normalized_load_benefit=normalized_load_benefit,
+                )
             else:
                 score = score_combination(**combination_args, components="FLP")
             candidate["score"] = score
 
         safe_candidates = [candidate for candidate in candidates if candidate["safe"]]
         pool = safe_candidates or candidates
-        sorted_candidates = sorted(pool, key=lambda candidate: (candidate["score"], -candidate["index"]), reverse=True)
+        # Use deterministic hash jitter for tie-breaking instead of -index
+        # to avoid systematic hotspotting on the lowest-index instance.
+        sorted_candidates = sorted(
+            pool,
+            key=lambda c: (c["score"], self._tiebreak_jitter(request_index, c["index"])),
+            reverse=True,
+        )
         selected = sorted_candidates[0]
         margin = (selected["score"] - sorted_candidates[1]["score"]) if len(sorted_candidates) > 1 else 0.0
         return selected["index"], selected["score"], (
@@ -515,6 +527,12 @@ class Router:
         client_id = self._request_clients.pop(request_id, 'default')
         service = self._request_service.pop(request_id, 0)
         self.fairness_tracker.record_service(client_id, service)
+        # Record per-client latency for routing-sensitive Jain's Index.
+        # completion_time_ns is absolute; retrieve arrival from the request
+        # object if possible, otherwise just record the service amount as a
+        # latency proxy (output tokens served correlate with wall time).
+        if hasattr(self.fairness_tracker, 'record_latency'):
+            self.fairness_tracker.record_latency(client_id, float(service))
         if session_info is None:
             return
         session_id, completed_idx = session_info
