@@ -13,6 +13,7 @@ __pycache__/
 bench/results/
 
 *.jsonl
+workloads/generators/nebius_dataset_cache/*
 
 # Ignore scratch simulation output. The committed example runs under
 # outputs/example_*.csv stay tracked; everything else in outputs/ is
