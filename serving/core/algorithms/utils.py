@@ -16,6 +16,12 @@ def normalize_inverse(value, min_value, max_value, eps=1e-8):
 
     return 1.0 - (value - min_value) / (max_value - min_value)
 
+def load_headroom(load: float) -> float:
+    """
+    Convert load into a non-negative headroom benefit [0, 1].
+    """
+    return max(0.0, 1.0 - load)
+
 # Load and locality scores
 
 def reactive_load(

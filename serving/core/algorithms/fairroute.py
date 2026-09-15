@@ -18,7 +18,7 @@ def normalize_feature(value, low=0.0, high=1.0, neutral=0.5):
 
 
 def normalize_candidates(values, higher_is_better=True):
-    """Candidate-relative normalization used by every composite router."""
+    """Candidate-relative min-max normalization used by relative literature policies."""
     values = [float(value) for value in values]
     if not values:
         return []
@@ -29,20 +29,46 @@ def normalize_candidates(values, higher_is_better=True):
     return normalized if higher_is_better else [1.0 - value for value in normalized]
 
 
+def normalize_candidates_magnitude(values, higher_is_better=True):
+    """Magnitude-preserving feature normalization.
+
+    Preserves absolute values and relative magnitudes across requests instead of
+    pinning every request set to [0, 1].
+    """
+    values = [float(value) for value in values]
+    if not values:
+        return []
+    if higher_is_better:
+        return [max(0.0, v) for v in values]
+    else:
+        return [max(0.0, 1.0 - v) for v in values]
+
+
 def score_combination(fairness, locality, prediction, components="FLP",
                       weights=None):
-    """Publication-friendly additive score for all F/L/P combinations.
+    """Publication-friendly true additive score for all F/L/P combinations.
 
-    All inputs are benefits in [0, 1]. Additive scoring avoids the near-zero
-    product collapse of multiplicative formulas while preserving the selected
-    feature trade-off.
+    Returns the unnormalized weighted sum alpha*F + beta*L + gamma*P.
     """
     weights = weights or {"F": 1.0, "L": 1.0, "P": 1.0}
     active = [key for key in "FLP" if key in components]
     if not active:
         return 0.0
     values = {"F": fairness, "L": locality, "P": prediction}
+    return sum(weights[key] * values[key] for key in active)
+
+
+def score_combination_normalized(fairness, locality, prediction, components="FLP",
+                                 weights=None):
+    """Normalized additive score (sum / total_weight) for explicit comparison across weights."""
+    weights = weights or {"F": 1.0, "L": 1.0, "P": 1.0}
+    active = [key for key in "FLP" if key in components]
+    if not active:
+        return 0.0
+    values = {"F": fairness, "L": locality, "P": prediction}
     total_weight = sum(weights[key] for key in active)
+    if total_weight <= 1e-8:
+        return 0.0
     return sum(weights[key] * values[key] for key in active) / total_weight
 
 
@@ -71,9 +97,15 @@ def score_cache_route(prefix_rate, capacity, assigned_load):
     return -(assigned_load + prefix_rate / replication)
 
 
-def score_vtc(client_counter, request_cost):
-    """VTC deficit-style priority: lower virtual service counter wins."""
-    return -(client_counter + request_cost)
+def score_vtc(client_counter, input_toks, output_toks, candidate_load=0.0, w_p=1.0, w_q=1.0):
+    """VTC deficit-style priority: lower virtual service counter wins.
+
+    Cost function h(n_p, n_q) = w_p * prompt_toks + w_q * gen_toks.
+    Incorporates candidate load so candidate scores vary while preserving client deficit ordering.
+    """
+    gen_toks = max(0, output_toks - input_toks)
+    request_cost = w_p * input_toks + w_q * gen_toks
+    return -(client_counter + request_cost * (1.0 + candidate_load))
 
 
 def score_equinox(user_counter, resource_counter, alpha=0.7, beta=0.3):
@@ -94,11 +126,20 @@ def score_isjl(progress, alpha=1.0):
 
 
 def score_nexussched(batch_size, sequence_tokens, coefficients=None):
-    """NexusSched structural iteration-latency model, returned as a benefit."""
-    coefficients = coefficients or (1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-    tau0, tau_b, tau_s, w0, ws, pmax = coefficients
-    denom = max(pmax * (1.0 - math.exp(-batch_size))
-                * (1.0 - math.exp(-sequence_tokens / 1024.0)), 1e-8)
+    """NexusSched structural iteration-latency model, returned as a benefit.
+
+    Eq. 1: T(B,S) = tau0 + Work(S)/Thr(B,S) + tau_b*B + tau_s*S
+    where Thr(B,S) = Pmax * (1 - exp(-k_b * B)) * (1 - exp(-k_s * S))
+    """
+    coefficients = coefficients or (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 / 1024.0)
+    if len(coefficients) == 6:
+        tau0, tau_b, tau_s, w0, ws, pmax = coefficients
+        k_b, k_s = 1.0, 1.0 / 1024.0
+    else:
+        tau0, tau_b, tau_s, w0, ws, pmax, k_b, k_s = coefficients
+
+    denom = max(pmax * (1.0 - math.exp(-k_b * batch_size))
+                * (1.0 - math.exp(-k_s * sequence_tokens)), 1e-8)
     latency = tau0 + (w0 + ws * sequence_tokens) / denom
     return -(latency + tau_b * batch_size + tau_s * sequence_tokens)
 
@@ -122,13 +163,14 @@ def score_online_lp(reward, resource_demand, shadow_price):
     """Online-LP reduced reward: utility minus capacity shadow price."""
     return reward - resource_demand * shadow_price
 
+
 def score_linear(
     fairness: float,
     locality: float,
     prediction: float,
-    alpha: float,
-    beta: float,
-    gamma: float,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
 ) -> float:
 
     return (
@@ -137,19 +179,21 @@ def score_linear(
         + gamma * prediction
     )
 
+
 def score_multiplicative(
     fairness: float,
     locality: float,
     prediction: float,
-    alpha: float,
-    beta: float,
-    gamma: float,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    eps: float = 1e-8,
 ) -> float:
-
+    """Multiplicative-gated component scoring: (1 + alpha*F) * (eps + L)^beta * (eps + P)^gamma."""
     return (
         (1.0 + alpha * fairness)
-        * (1.0 + beta * locality)
-        * (1.0 + gamma * prediction)
+        * ((eps + locality) ** beta)
+        * ((eps + prediction) ** gamma)
     )
 
 def score_fairness_gated(
