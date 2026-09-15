@@ -77,21 +77,30 @@ def score_fairroute_v2(
 | `FAIRNESS` | Single-component | Routes based purely on per-candidate fairness benefit |
 | `LOCALITY` | Single-component | Routes based purely on prefix-cache hit ratio |
 | `PREDICTION` | Single-component | Routes based purely on predicted queue depth / load |
-| `F_L`, `L_P`, `F_P`, `F_L_P` | Combinations | Linear combinations of normalized component benefits |
-| `H0` | Hypothesis 0 | Equal weighted linear sum ($F + L + P$) |
-| `H1` | Hypothesis 1 | Multiplicative component scoring ($(1+F) \cdot L \cdot P$) |
+| `F_L`, `L_P`, `F_P`, `F_L_P` | Combinations | Additive linear combinations of component benefits |
+| `H0` / `FAIRROUTE_LINEAR` | Hypothesis 0 | Unnormalized weighted linear sum ($\alpha F + \beta L + \gamma P$) |
+| `H1` | Hypothesis 1 | Multiplicative component scoring ($(1+\alpha F) \cdot (\epsilon+L)^\beta \cdot (\epsilon+P)^\gamma$) |
 | `H2` | Hypothesis 2 | Fairness-gated locality scoring |
 | `H3` | Hypothesis 3 | Adaptive Fairness-Locality Control (AFLC) |
-| `H4` / `FAIRROUTE` | Hypothesis 4 | FairRoute v1 temperature-scaled score |
+| `H4` / `FAIRROUTE` / `FAIRROUTE_GATED` | Hypothesis 4 | FairRoute v1 temperature-scaled gated score |
 | `H5` / `FAIRROUTE_V2` | Hypothesis 5 | **FairRoute-v2**: Deficit-driven adaptive weighted scoring |
 | `PREBLE`, `LBGR`, `DUALMAP`, `CACHE_ROUTE`, `VTC`, `EQUINOX`, `QUARTZ`, `ISJL`, `NEXUSSCHED`, `BALANCEROUTE`, `PILLM`, `ONLINE_LP` | Literature | Implementations of published multi-tenant LLM routing algorithms |
 
 ---
 
-## 4. File Structure
+## 4. Architectural Fixes & Refinements
+
+- **Magnitude-Preserving Normalization**: `normalize_candidates_magnitude` preserves absolute scales and headroom across requests for $H_0$–$H_5$ and combination policies instead of squashing every candidate set to $\{0, 1\}$.
+- **Additive Score Sum**: `score_combination` computes true weighted sum $\sum w_i v_i$ rather than forcing division by total weight, allowing weight sweeps ($\alpha, \beta, \gamma$) to expand/compress the score range as intended.
+- **NexusSched Parameterization**: `score_nexussched` accepts full 8-tuple `(tau0, tau_b, tau_s, w0, ws, pmax, k_b, k_s)` for exact paper saturation rates.
+- **VTC Candidate Scoring**: `score_vtc` computes prompt and generation costs $w_p \cdot n_p + w_q \cdot n_q$ and scales cost by candidate load to produce candidate-varying scores.
+
+---
+
+## 5. File Structure
 
 - [`fairness.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/fairness.py): Client debt tracking (`FairnessTracker`), target calculation, urgency functions, and latency-based Jain's Index.
-- [`fairroute.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/fairroute.py): Scoring functions for `H0`–`H5`, `FAIRROUTE`, AFLC, and gated routing.
+- [`fairroute.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/fairroute.py): Modular scoring functions for `H0`–`H5`, `FAIRROUTE`, AFLC, NexusSched, VTC, and magnitude-preserving normalization.
 - [`locality.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/locality.py): Prefix-cache hit ratio and locality scoring functions.
 - [`prediction.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/prediction.py): Queue prediction, load benefit, and risk estimation.
-- [`utils.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/utils.py): Feature normalization (`normalize_candidates`) and utility helpers.
+- [`utils.py`](file:///home/sriram/sem7/p1/LLMServingSim/serving/core/algorithms/utils.py): Load headroom and utility helpers.

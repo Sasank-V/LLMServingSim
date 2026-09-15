@@ -1,6 +1,8 @@
 import bisect
 import hashlib
 import json
+import math
+import os
 import random
 from .request import Request
 from .algorithms.fairness import (
@@ -16,6 +18,7 @@ from .algorithms.fairroute import (
     score_linear,
     score_multiplicative,
     score_combination,
+    score_combination_normalized,
     score_preble,
     score_lbgr,
     score_dualmap,
@@ -29,6 +32,7 @@ from .algorithms.fairroute import (
     score_online_lp,
     score_fairroute_v2,
     normalize_candidates,
+    normalize_candidates_magnitude,
 )
 from .algorithms.locality import (
     locality_score,
@@ -40,7 +44,7 @@ from .algorithms.prediction import (
     prediction_risk,
     replica_is_safe,
 )
-from .algorithms.utils import kv_utilization, load_benefit, reactive_load
+from .algorithms.utils import kv_utilization, load_benefit, load_headroom, reactive_load
 from .logger import get_logger
 
 
@@ -69,11 +73,14 @@ class Router:
         self._request_clients = {}
         self._request_service = {}
         self.custom_routing_fn = custom_routing_fn
+        self._routed_scores = []
+        self._routed_margins = []
         self._routing_policy_names = {
-            "H0", "H1", "H2", "H3", "H4", "H5", "FAIRROUTE", "FAIRROUTE_V2",
-            "FAIRNESS", "LOCALITY", "PREDICTION", "F_L", "L_P", "F_P", "F_L_P",
-            "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE", "VTC", "EQUINOX",
-            "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE", "PILLM", "ONLINE_LP",
+            "H0", "H1", "H2", "H3", "H4", "H5", "FAIRROUTE", "FAIRROUTE_LINEAR",
+            "FAIRROUTE_GATED", "FAIRROUTE_V2", "FAIRNESS", "LOCALITY", "PREDICTION",
+            "F_L", "L_P", "F_P", "F_L_P", "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE",
+            "VTC", "EQUINOX", "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE",
+            "PILLM", "ONLINE_LP",
         }
 
         # Pending requests (loaded but not yet routed)
@@ -99,7 +106,8 @@ class Router:
             self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, H0-H5, FAIRROUTE, FAIRROUTE_V2, "
+                             "Supported: RR, RAND, LOAD, H0-H5, FAIRROUTE, "
+                             "FAIRROUTE_LINEAR, FAIRROUTE_GATED, FAIRROUTE_V2, "
                              "FAIRNESS, LOCALITY, PREDICTION, F_L, L_P, F_P, F_L_P, "
                              "and literature policies")
         self.logger = get_logger(self.__class__)
@@ -254,18 +262,15 @@ class Router:
                 "kv_util": kv_util,
             })
 
-        # Normalize candidate-dependent features once. Every policy below then
-        # operates on comparable [0, 1] benefits instead of raw queue/token units.
-        locality_values = normalize_candidates([c["locality"] for c in candidates])
-        prediction_values = normalize_candidates([c["prediction"] for c in candidates])
-        load_values = normalize_candidates([c["load"] for c in candidates], higher_is_better=False)
+        # Use magnitude-preserving normalization for composite and FairRoute policies so
+        # absolute scales and gaps are preserved across requests instead of being forced to [0, 1].
+        locality_values = normalize_candidates_magnitude([c["locality"] for c in candidates], higher_is_better=True)
+        prediction_values = normalize_candidates_magnitude([c["prediction"] for c in candidates], higher_is_better=True)
+        load_values = normalize_candidates_magnitude([c["load"] for c in candidates], higher_is_better=False)
 
         # Per-candidate fairness: urgency * load_headroom.  An underserved
         # client (high urgency) is steered toward the least-loaded replica;
         # a well-served client (urgency ≈ 0) lets locality/prediction dominate.
-        # This makes fairness genuinely vary across candidates, unlike the old
-        # scalar `fairness_value` that was identical for every candidate and
-        # collapsed all F-containing policies to ties on instance 0.
         fairness_values = [urgency * lb for lb in load_values]
 
         for index, candidate in enumerate(candidates):
@@ -296,7 +301,12 @@ class Router:
             elif policy == "CACHE_ROUTE":
                 score = score_cache_route(1.0, max(1.0, candidate["capacity"]), candidate["load"])
             elif policy == "VTC":
-                score = score_vtc(self.fairness_tracker.get_service(client_id), req_data["input_toks"])
+                score = score_vtc(
+                    client_counter=self.fairness_tracker.get_service(client_id),
+                    input_toks=req_data["input_toks"],
+                    output_toks=req_data["output_toks"],
+                    candidate_load=candidate["load"],
+                )
             elif policy == "EQUINOX":
                 score = score_equinox(debt, candidate["load"])
             elif policy == "QUARTZ":
@@ -312,7 +322,7 @@ class Router:
                 score = score_pillm(req_data["input_toks"], candidate["queue"], req_data["output_toks"])
             elif policy == "ONLINE_LP":
                 score = score_online_lp(normalized_load_benefit, candidate["queue"], 1.0)
-            elif policy == "H0":
+            elif policy in ("H0", "FAIRROUTE_LINEAR"):
                 score = score_linear(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
             elif policy == "H1":
                 score = score_multiplicative(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
@@ -321,7 +331,7 @@ class Router:
                 score = score_fairness_gated(fairness_benefit, 0.5, locality, prediction, beta=beta_h2)
             elif policy == "H3":
                 score = score_aflc(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0, debt)
-            elif policy in ("H4", "FAIRROUTE"):
+            elif policy in ("H4", "FAIRROUTE", "FAIRROUTE_GATED"):
                 capacity_val = candidate["capacity"]
                 score = fairroute_score(
                     debt, urgency, locality, candidate["risk"],
@@ -350,9 +360,34 @@ class Router:
         )
         selected = sorted_candidates[0]
         margin = (selected["score"] - sorted_candidates[1]["score"]) if len(sorted_candidates) > 1 else 0.0
+        self._routed_scores.append(selected["score"])
+        self._routed_margins.append(margin)
         return selected["index"], selected["score"], (
             debt, urgency, selected["locality"], selected["prediction"], selected["hit"], margin
         )
+
+    def get_score_stats(self):
+        """Return aggregate statistics of routing scores and margins for monitoring."""
+        if not self._routed_scores:
+            return {"min": 0.0, "mean": 0.0, "max": 0.0, "std": 0.0, "margin_mean": 0.0, "margin_std": 0.0, "count": 0}
+        scores = self._routed_scores
+        margins = self._routed_margins
+        n = len(scores)
+        mean_score = sum(scores) / n
+        var_score = sum((x - mean_score) ** 2 for x in scores) / n
+        std_score = math.sqrt(var_score)
+        mean_margin = sum(margins) / n
+        var_margin = sum((x - mean_margin) ** 2 for x in margins) / n
+        std_margin = math.sqrt(var_margin)
+        return {
+            "min": min(scores),
+            "mean": mean_score,
+            "max": max(scores),
+            "std": std_score,
+            "margin_mean": mean_margin,
+            "margin_std": std_margin,
+            "count": n,
+        }
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -369,7 +404,8 @@ class Router:
         pending queue. Subsequent sub-requests are released dynamically
         via notify_request_completed() when predecessors finish.
         """
-        path = f'../{path}'
+        if not os.path.exists(path) and os.path.exists(f'../{path}'):
+            path = f'../{path}'
         self._enable_prefix_caching = enable_prefix_caching
         self._is_init = is_init
         loaded_lines = 0

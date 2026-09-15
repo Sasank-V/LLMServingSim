@@ -282,7 +282,8 @@ def main():
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
     parser.add_argument('--request-routing-policy', type=str,
                         choices=[
-                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'H5', 'FAIRROUTE', 'FAIRROUTE_V2',
+                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'H5',
+                            'FAIRROUTE', 'FAIRROUTE_LINEAR', 'FAIRROUTE_GATED', 'FAIRROUTE_V2',
                             'FAIRNESS', 'LOCALITY', 'PREDICTION', 'F_L', 'L_P', 'F_P', 'F_L_P',
                             'PREBLE', 'LBGR', 'DUALMAP', 'CACHE_ROUTE', 'VTC', 'EQUINOX',
                             'QUARTZ', 'ISJL', 'NEXUSSCHED', 'BALANCEROUTE', 'PILLM', 'ONLINE_LP',
@@ -291,7 +292,7 @@ def main():
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), H0-H5 (FairRoute hypotheses), '
-                        'FAIRROUTE, feature combinations, and literature policies (CUSTOM is user-defined)')
+                        'FAIRROUTE, FAIRROUTE_LINEAR, FAIRROUTE_GATED, feature combinations, and literature policies (CUSTOM is user-defined)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -443,6 +444,10 @@ def main():
     if network_backend == 'analytical':
         network=run_paths.network_config
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
+        if not os.path.exists(binary):
+            fallback_binary = os.path.join(astra_sim, "build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware")
+            if os.path.exists(fallback_binary):
+                binary = fallback_binary
     elif network_backend == 'ns3':
         network=_prepare_ns3_config(astra_sim, run_paths)
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
@@ -1256,6 +1261,15 @@ def main():
     print_markup(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
     print_markup(f"Throughput per {log_interval:g} sec (\\[prompt_throughput], \\[gen_throughput]): {throughput}")
     print_rule()
+    score_stats = router.get_score_stats()
+    if score_stats["count"] > 0:
+        print_rule("[sim.tagline]Router Policy Statistics[/]")
+        print_markup(f"Routed requests count:                                             {score_stats['count']}")
+        print_markup(f"Score min / mean / max / std:                                       {score_stats['min']:.4f} / {score_stats['mean']:.4f} / {score_stats['max']:.4f} / {score_stats['std']:.4f}")
+        print_markup(f"Score decision margin mean / std:                                   {score_stats['margin_mean']:.4f} / {score_stats['margin_std']:.4f}")
+        if score_stats["std"] < 1e-6 and score_stats["count"] > 1:
+            logger.warning("Router score std is near zero! Check for policy re-collapse.")
+        print_rule()
     if any_prefix_caching:
         print_rule("[sim.tagline]Prefix Caching Results[/]")
         print_markup(f"Total requested prompt tokens:                                      {total_requested_tokens}")
