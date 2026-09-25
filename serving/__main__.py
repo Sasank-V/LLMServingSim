@@ -287,6 +287,7 @@ def main():
                             'FAIRNESS', 'LOCALITY', 'PREDICTION', 'F_L', 'L_P', 'F_P', 'F_L_P',
                             'PREBLE', 'LBGR', 'DUALMAP', 'CACHE_ROUTE', 'VTC', 'EQUINOX',
                             'QUARTZ', 'ISJL', 'NEXUSSCHED', 'BALANCEROUTE', 'PILLM', 'ONLINE_LP',
+                            'LODESTAR', 'PAST_FUTURE', 'BF_IO', 'BALANCEROUTE_H', 'QUARTZ_PRED',
                             'CUSTOM',
                         ],
                         default='LOAD',

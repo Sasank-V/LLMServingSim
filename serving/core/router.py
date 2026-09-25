@@ -45,6 +45,7 @@ from .algorithms.prediction import (
     replica_is_safe,
 )
 from .algorithms.utils import kv_utilization, load_benefit, load_headroom, reactive_load
+from .algorithms.predictive_routing import PREDICTIVE_ROUTER_CLASSES
 from .logger import get_logger
 
 
@@ -81,7 +82,20 @@ class Router:
             "F_L", "L_P", "F_P", "F_L_P", "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE",
             "VTC", "EQUINOX", "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE",
             "PILLM", "ONLINE_LP",
+            "LODESTAR", "PAST_FUTURE", "BF_IO", "BALANCEROUTE_H", "QUARTZ_PRED",
         }
+        self._predictive_policy_names = {
+            "LODESTAR", "PAST_FUTURE", "BF_IO", "BALANCEROUTE_H", "QUARTZ_PRED",
+        }
+        # Initialize predictive router if policy is one of the 5 predictive algorithms
+        if self.routing_policy in self._predictive_policy_names:
+            router_cls = PREDICTIVE_ROUTER_CLASSES[self.routing_policy]
+            self._predictive_router = router_cls(
+                num_instances=len(self.prefill_schedulers),
+                seed=seed,
+            )
+        else:
+            self._predictive_router = None
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -159,7 +173,15 @@ class Router:
     def _fair_route(self, schedulers, role, req_data=None):
         if req_data is None:
             raise RuntimeError("FairRoute selection requires request data")
+        # Dispatch to predictive router if applicable
+        if self._predictive_router is not None:
+            return self._select_predictive_candidate(schedulers, req_data)
         return self._select_fairroute_candidate(schedulers, req_data)
+
+    def _select_predictive_candidate(self, schedulers, req_data):
+        """Dispatch routing to one of the 5 predictive routing algorithms."""
+        idx, score, metrics = self._predictive_router.route(req_data, schedulers)
+        return idx, score, metrics
 
     def _request_to_route_data(self, req):
         """Build the same candidate input for routed and handed-off requests."""
@@ -563,6 +585,14 @@ class Router:
         client_id = self._request_clients.pop(request_id, 'default')
         service = self._request_service.pop(request_id, 0)
         self.fairness_tracker.record_service(client_id, service)
+        # Update predictive router state with completed request data
+        if self._predictive_router is not None:
+            for sched in self.schedulers:
+                for req in sched.done:
+                    if req.id == request_id:
+                        self._predictive_router.on_request_completed(
+                            req, req.instance_id, completion_time_ns)
+                        break
         # Record per-client latency for routing-sensitive Jain's Index.
         # completion_time_ns is absolute; retrieve arrival from the request
         # object if possible, otherwise just record the service amount as a
