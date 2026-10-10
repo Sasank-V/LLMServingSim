@@ -2,6 +2,7 @@ import bisect
 import pandas as pd
 from time import time
 import csv
+import json
 import os
 
 from .request import *
@@ -552,8 +553,11 @@ class Scheduler:
                     'arrival', 'end_time', 'latency', 'queuing_delay', 'TTFT', 'TPOT', 'ITL',
                     'routing policy', 'fairness debt', 'fairness urgency',
                     'locality', 'prediction', 'routing score', 'routing score margin',
+                    'routing decision ns', 'routing stage', 'routing gate size',
+                    'routing slack size', 'routing credit exhausted',
                     'prefix_cache_hit', 'npu_cache_hit', 'storage_cache_hit',
-                    'recompute_tokens', 'num_preemptions'
+                    'recompute_tokens', 'num_preemptions',
+                    'session_id', 'sub_request_index'
                 ])
             
             # Write each request's information
@@ -563,15 +567,15 @@ class Scheduler:
                     req.id,
                     req.client_id,
                     req.model,
-                    req.input,
-                    req.output - req.input,
+                    req.original_input,
+                    max(0, req.output - req.original_input),
                     req.arrival,
                     req.end_time,
                     req.latency,
                     req.queuing_delay,
                     req.ttft,
                     req.tpot,
-                    req.itl,
+                    json.dumps(req.itl, separators=(',', ':')),
                     getattr(req, 'routing_policy', ''),
                     getattr(req, 'routing_fairness_debt', 0.0),
                     getattr(req, 'routing_fairness_urgency', 0.0),
@@ -579,11 +583,18 @@ class Scheduler:
                     getattr(req, 'routing_prediction', 0.0),
                     getattr(req, 'routing_score', 0.0),
                     getattr(req, 'routing_score_margin', 0.0),
+                    getattr(req, 'routing_decision_ns', 0),
+                    getattr(req, 'routing_stage', ''),
+                    getattr(req, 'routing_gate_size', 0),
+                    getattr(req, 'routing_slack_size', 0),
+                    int(getattr(req, 'routing_credit_exhausted', False)),
                     getattr(req, 'prefix_cache_hit', 0),
                     getattr(req, 'npu_cache_hit', 0),
                     getattr(req, 'storage_cache_hit', 0),
                     max(0, req.original_input - getattr(req, 'prefix_cache_hit', 0)),
                     getattr(req, 'num_preemptions', 0),
+                    getattr(req, 'session_id', ''),
+                    getattr(req, 'sub_request_index', ''),
                 ])
 
 

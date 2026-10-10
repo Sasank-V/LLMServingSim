@@ -78,6 +78,11 @@ class Request:
         self.routing_score = 0.0
         self.routing_score_margin = 0.0
         self.routing_policy = ""
+        self.routing_stage = ""
+        self.routing_gate_size = 0
+        self.routing_slack_size = 0
+        self.routing_credit_exhausted = False
+        self.routing_decision_ns = 0
 
     # to print the request information
     def __str__(self):

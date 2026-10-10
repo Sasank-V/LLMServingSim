@@ -282,30 +282,26 @@ def main():
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
     parser.add_argument('--request-routing-policy', type=str,
                         choices=[
-                            'LOAD', 'RR', 'RAND', 'H0', 'H1', 'H2', 'H3', 'H4', 'H5',
-                            'FAIRROUTE', 'FAIRROUTE_LINEAR', 'FAIRROUTE_GATED', 'FAIRROUTE_V2',
-                            'FAIRNESS', 'LOCALITY', 'PREDICTION', 'F_L', 'L_P', 'F_P', 'F_L_P',
-                            'PREBLE', 'LBGR', 'DUALMAP', 'CACHE_ROUTE', 'VTC', 'EQUINOX',
-                            'QUARTZ', 'ISJL', 'NEXUSSCHED', 'BALANCEROUTE', 'PILLM', 'ONLINE_LP',
+                            'LOAD', 'RR', 'RAND', 'FAIRROUTE', 'FAIRROUTE_V2',
+                            'FAIRROUTE_LINEAR', 'FAIRROUTE_MULTIPLICATIVE',
+                            'FAIRROUTE_GATED', 'FAIRROUTE_LEXICOGRAPHIC',
+                            'FAIRROUTE_SLACK', 'FAIRROUTE_LEARNED',
+                            'PRISM', 'D2LPM',
                             'CUSTOM',
                         ],
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
-                        'RR (round-robin), RAND (random), H0-H5 (FairRoute hypotheses), '
-                        'FAIRROUTE, FAIRROUTE_LINEAR, FAIRROUTE_GATED, feature combinations, and literature policies (CUSTOM is user-defined)')
+                        'RR (round-robin), RAND (random), or one of the explicit FairRoute combination forms '
+                        '(CUSTOM is user-defined)')
+    parser.add_argument('--fairroute-n0', type=float, default=0.0,
+                        help='EWMA prior weight for FairRoute client estimates (0 preserves current behavior).')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
-                        help='expert token routing policy for MoE models: '
-                        'BALANCED (default; analytical pigeonhole approximation of '
-                        'a trained load-balanced learned gate), '
-                        'RR (round-robin), RAND (uniform random per token), '
-                        'CUSTOM (user-defined)')
+                        help='expert token routing policy for MoE models')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Replay one transformer block\'s trace across every '
-                        'layer instead of re-computing the routing per layer — '
-                        'cuts trace-generation time roughly num_hidden_layers× '
                         'on MoE models. Safe with BALANCED (deterministic); '
                         'RR/RAND get a small per-layer variance averaged out. '
                         'Disable only for CUSTOM policies that need faithful '
@@ -581,7 +577,8 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy,
+                    fairroute_n0=args.fairroute_n0)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -1308,6 +1305,7 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+        router.save_diagnostics(output_file)
 
     # --save-trace-text writes the text into the run directory, so keeping it
     # is implied: producing the text and then deleting it would be pointless.

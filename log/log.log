@@ -1,0 +1,6 @@
+[2026-10-10 03:54:49.319] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 1 index in ring: 0 offset: 1 total nodes in ring: 1
+[2026-10-10 03:54:49.319] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 1 index in ring: 0 offset: 1 total nodes in ring: 1
+[2026-10-10 03:54:49.319] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 1 index in ring: 0 offset: 1 total nodes in ring: 1
+[2026-10-10 03:54:49.319] [system::topology::RingTopology] [info] ring of node 0, id: 0 dimension: local total nodes in ring: 1 index in ring: 0 offset: 1 total nodes in ring: 1
+[2026-10-10 03:54:49.319] [workload] [info] sys[0] iteration 0 finished, 46926808 cycles, exposed communication 0 cycles.
+[2026-10-10 03:54:49.319] [workload] [info] Waiting

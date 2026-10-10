@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import time
 from .request import Request
 from .algorithms.fairness import (
     FairnessTracker,
@@ -12,39 +13,14 @@ from .algorithms.fairness import (
     fairness_urgency,
 )
 from .algorithms.fairroute import (
-    fairroute_score,
-    score_aflc,
-    score_fairness_gated,
-    score_linear,
-    score_multiplicative,
-    score_combination,
-    score_combination_normalized,
-    score_preble,
-    score_lbgr,
-    score_dualmap,
-    score_cache_route,
-    score_vtc,
-    score_equinox,
-    score_quartz,
-    score_nexussched,
-    score_pillm,
-    score_balance_route,
-    score_online_lp,
-    score_fairroute_v2,
-    normalize_candidates,
-    normalize_candidates_magnitude,
+    choose_fairroute_candidate,
+    fairroute_gate,
+    iteration_time,
+    predict_latency_seconds,
 )
-from .algorithms.locality import (
-    locality_score,
-    adaptive_locality_weight
-)
-from .algorithms.prediction import (
-    predict_queue,
-    prediction_benefit,
-    prediction_risk,
-    replica_is_safe,
-)
-from .algorithms.utils import kv_utilization, load_benefit, load_headroom, reactive_load
+from .algorithms.locality import locality_score
+from .algorithms.prediction import predict_queue, replica_is_safe
+from .algorithms.utils import kv_utilization, reactive_load
 from .logger import get_logger
 
 
@@ -56,6 +32,7 @@ class Router:
             routing_policy="RR",
             seed=42,
             custom_routing_fn=None,
+            fairroute_n0=0.0,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -72,15 +49,44 @@ class Router:
         self.fairness_tracker = FairnessTracker()
         self._request_clients = {}
         self._request_service = {}
+        self._request_arrivals = {}
+        self._request_instances = {}
+        self._request_output_estimates = {}
+        self._client_output_ewma = {}
+        self._client_credit = {}
+        self._client_delay_ewma = {}
+        self._client_delay_samples = {}
+        self._client_credit_refill = {}
+        self._replica_service = {}
+        self._known_clients = set()
+        self._total_service = 0.0
         self.custom_routing_fn = custom_routing_fn
+        self.fairroute_n0 = max(0.0, float(fairroute_n0))
+        self._global_output_ewma = 1.0
+        self._global_delay_ewma = 0.0
+        self._global_output_samples = []
+        self._policy_params = {
+            "prism_p": 4.0,
+            "prism_beta": 2.0,
+            "h_min": 16,
+            "fairroute_h_min": 256,
+            "fairroute_gamma": 1.0,
+            "fairroute_eps_max": 0.100,
+            "fairroute_rho_slack": 0.25,
+            "fairroute_k": 10.0,
+            "credit_w_e": 1.0,
+            "credit_w_q": 2.0,
+            "credit_kappa": 1.0,
+        }
+        self._decision_times_ns = []
         self._routed_scores = []
         self._routed_margins = []
+        self._routing_stage_counts = {}
         self._routing_policy_names = {
-            "H0", "H1", "H2", "H3", "H4", "H5", "FAIRROUTE", "FAIRROUTE_LINEAR",
-            "FAIRROUTE_GATED", "FAIRROUTE_V2", "FAIRNESS", "LOCALITY", "PREDICTION",
-            "F_L", "L_P", "F_P", "F_L_P", "PREBLE", "LBGR", "DUALMAP", "CACHE_ROUTE",
-            "VTC", "EQUINOX", "QUARTZ", "ISJL", "NEXUSSCHED", "BALANCEROUTE",
-            "PILLM", "ONLINE_LP",
+            "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_LINEAR",
+            "FAIRROUTE_MULTIPLICATIVE", "FAIRROUTE_GATED",
+            "FAIRROUTE_LEXICOGRAPHIC", "FAIRROUTE_SLACK",
+            "FAIRROUTE_LEARNED", "PRISM", "D2LPM",
         }
 
         # Pending requests (loaded but not yet routed)
@@ -106,10 +112,7 @@ class Router:
             self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, H0-H5, FAIRROUTE, "
-                             "FAIRROUTE_LINEAR, FAIRROUTE_GATED, FAIRROUTE_V2, "
-                             "FAIRNESS, LOCALITY, PREDICTION, F_L, L_P, F_P, F_L_P, "
-                             "and literature policies")
+                             "Supported: RR, RAND, LOAD, and FairRoute policies")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -159,7 +162,73 @@ class Router:
     def _fair_route(self, schedulers, role, req_data=None):
         if req_data is None:
             raise RuntimeError("FairRoute selection requires request data")
+        if self.routing_policy == "PRISM":
+            return self._select_prism(schedulers, req_data)
+        if self.routing_policy == "D2LPM":
+            return self._select_d2lpm(schedulers, req_data)
+        if self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
+            return self._select_fairroute_v2(schedulers, req_data)
         return self._select_fairroute_candidate(schedulers, req_data)
+
+    def _select_fairroute_v2(self, schedulers, req_data):
+        candidates, estimate = self._candidate_set(schedulers, req_data)
+        gamma = self._policy_params["fairroute_gamma"]
+        gated = [
+            c for c in candidates
+            if c["free_kv"] >= c["kv"]
+            and c["ttft"] <= gamma * c["slo"]
+        ]
+        slo_risk = not gated
+        if not gated:
+            gated = candidates
+        best_latency = min(c["predicted_latency"] for c in gated)
+        client_id = req_data.get("client_id", "default")
+        delays = [
+            value for owner, value in self._client_delay_ewma.items()
+            if owner in self._known_clients
+        ]
+        median_delay = sorted(delays)[len(delays) // 2] if delays else 0.0
+        client_delay = self._client_delay_ewma.get(client_id, 0.0)
+        urgency = 0.0
+        if self.fairroute_n0 and median_delay > 0 and client_delay / median_delay > 1:
+            urgency = min(1.0, client_delay / median_delay - 1.0)
+        epsilon = min(
+            self._policy_params["fairroute_eps_max"],
+            self._policy_params["fairroute_rho_slack"] * best_latency,
+        ) * (1.0 - urgency)
+        slack = [c for c in gated if c["predicted_latency"] <= best_latency + epsilon]
+        mean_service = (
+            sum(self._replica_service.get(i, 0.0) for i in range(len(schedulers)))
+            / max(1, len(schedulers))
+        )
+        for candidate in slack:
+            candidate["locality_key"] = (
+                candidate["hit"]
+                if candidate["hit"] >= self._policy_params["fairroute_h_min"]
+                and candidate["credit"] > 0
+                else 0
+            )
+            candidate["deficit"] = (
+                mean_service - candidate["service"]
+            ) / max(mean_service, 1.0)
+        selected = min(
+            slack,
+            key=lambda c: (
+                -c["locality_key"],
+                -c["deficit"],
+                c["predicted_latency"],
+                c["index"],
+            ),
+        )
+        result = self._finish_policy_choice(selected, -selected["predicted_latency"],
+                                             "fallback" if slo_risk else "slack",
+                                             candidates)
+        self._replica_service[selected["index"]] = (
+            self._replica_service.get(selected["index"], 0.0)
+            + self._policy_params["credit_w_e"] * selected["n_ext"]
+            + self._policy_params["credit_w_q"] * estimate
+        )
+        return result
 
     def _request_to_route_data(self, req):
         """Build the same candidate input for routed and handed-off requests."""
@@ -214,6 +283,147 @@ class Router:
         kv_util = kv_utilization(used_blocks, total_blocks)
         return load, predicted_queue, kv_util
 
+    def _queued_tokens(self, sched):
+        """Approximate W_i from pending prompts and running remainders."""
+        pending = sum(max(0, int(getattr(req, "num_tokens", req.input)))
+                      for req in sched.waiting)
+        running = sum(max(0, int(getattr(req, "num_tokens", req.input)
+                                  - getattr(req, "num_computed_tokens", 0)))
+                      for req in sched.running)
+        return pending + running
+
+    def _free_kv_tokens(self, sched):
+        pool = getattr(getattr(sched, "memory", None), "npu_pool", None)
+        if pool is None:
+            return float("inf")
+        return max(0, pool.num_blocks - pool.used_blocks) * pool.block_size
+
+    def _predictor_terms(self, sched, req_data, hit, output_estimate):
+        n_in = float(req_data["input_toks"])
+        n_ext = max(0.0, n_in - hit)
+        b = len(sched.running) + len(sched.waiting)
+        d = sum(1 for req in sched.running
+                if getattr(req, "num_tokens", req.input)
+                <= getattr(req, "num_computed_tokens", 0) + 1)
+        s_max = max(1, int(getattr(sched, "max_num_batched_tokens", 1)))
+        w = self._queued_tokens(sched)
+        capacity = max(1, s_max - d)
+        t_base = iteration_time(b + 1, s_max, p_max=s_max)
+        ttft = math.ceil((w + n_ext) / capacity) * t_base
+        decode = output_estimate * iteration_time(d + 1, d + 1, p_max=s_max)
+        total = ttft + decode
+        slo = self._policy_params["fairroute_k"] * math.ceil(n_in / s_max) * iteration_time(1, s_max, p_max=s_max)
+        return {
+            "hit": hit,
+            "n_ext": n_ext,
+            "W": w,
+            "B": b,
+            "D": d,
+            "S_max": s_max,
+            "ttft": ttft,
+            "decode": decode,
+            "predicted_latency": total,
+            "slo": max(slo, 1e-9),
+            "kv": n_in + output_estimate,
+            "free_kv": self._free_kv_tokens(sched),
+            "requests": b + len(sched.waiting),
+        }
+
+    def _client_output_estimate(self, client_id):
+        value = self._client_output_ewma.get(client_id, self._global_output_ewma)
+        if self.fairroute_n0:
+            value = (
+                value + self.fairroute_n0 * self._global_output_ewma
+            ) / (1.0 + self.fairroute_n0)
+        return max(1.0, value)
+
+    def _credit_quantum(self, sched):
+        config = getattr(sched, "config", {})
+        max_in = config.get("max_position_embeddings", 2048)
+        max_out = 1024
+        return self._policy_params["credit_kappa"] * (
+            self._policy_params["credit_w_e"] * max_in
+            + self._policy_params["credit_w_q"] * max_out
+        )
+
+    def _credit(self, client_id, index, schedulers):
+        key = (client_id, index)
+        if key not in self._client_credit:
+            self._client_credit[key] = self._credit_quantum(schedulers[index])
+        owner_values = [
+            self._client_credit.setdefault(
+                (client_id, replica), self._credit_quantum(schedulers[replica])
+            )
+            for replica in range(len(schedulers))
+        ]
+        if not any(value > 0 for value in owner_values):
+            for replica in range(len(schedulers)):
+                self._client_credit[(client_id, replica)] += self._credit_quantum(schedulers[replica])
+        return self._client_credit[key]
+
+    def _candidate_set(self, schedulers, req_data):
+        client_id = req_data.get("client_id", "default")
+        estimate = self._client_output_estimate(client_id)
+        candidates = []
+        for index, sched in enumerate(schedulers):
+            hit = self._replica_locality(sched, req_data)
+            terms = self._predictor_terms(sched, req_data, hit, estimate)
+            terms.update({
+                "index": index,
+                "client_id": client_id,
+                "credit": self._credit(client_id, index, schedulers),
+                "service": self._replica_service.get(index, 0.0),
+                "safe": terms["free_kv"] >= terms["kv"],
+            })
+            candidates.append(terms)
+        return candidates, estimate
+
+    def _select_prism(self, schedulers, req_data):
+        candidates, _ = self._candidate_set(schedulers, req_data)
+        p = self._policy_params["prism_p"]
+        beta = self._policy_params["prism_beta"]
+        selected = None
+        best = -1.0
+        for candidate in candidates:
+            s_lat = 1.0 / (1.0 + (candidate["predicted_latency"] / candidate["slo"]) ** p)
+            rho = candidate["W"] / max(1.0, candidate["S_max"])
+            s_load = 1.0 / (1.0 + (rho / candidate["slo"]) ** p)
+            s_cap = max(0.0, min(1.0, (candidate["free_kv"] - candidate["kv"]) / max(candidate["kv"], 1e-9)))
+            affinity = beta if candidate["hit"] >= self._policy_params["h_min"] else 1.0
+            score = s_lat * s_load * s_cap * affinity
+            if score > best or (score == best and (selected is None or candidate["requests"] < selected["requests"])):
+                selected, best = candidate, score
+        return self._finish_policy_choice(selected, best, "prism", candidates)
+
+    def _select_d2lpm(self, schedulers, req_data):
+        candidates, _ = self._candidate_set(schedulers, req_data)
+        matched = [c for c in candidates if c["hit"] >= self._policy_params["h_min"]]
+        max_hit = max((c["hit"] for c in candidates), default=0)
+        group = [c for c in matched if c["hit"] == max_hit] if max_hit >= self._policy_params["h_min"] else candidates
+        active = [c for c in candidates if c["credit"] > 0]
+        eligible = [c for c in group if c["credit"] > 0]
+        pool = eligible or active
+        if not pool:
+            self._refill_credits(req_data.get("client_id", "default"), schedulers)
+            pool = candidates
+        selected = min(pool, key=lambda c: (c["requests"], c["index"]))
+        return self._finish_policy_choice(selected, -selected["requests"], "d2lpm", candidates)
+
+    def _refill_credits(self, client_id, schedulers):
+        for index, sched in enumerate(schedulers):
+            self._client_credit[(client_id, index)] = self._credit_quantum(sched)
+
+    def _finish_policy_choice(self, selected, score, stage, candidates):
+        client_id = selected["client_id"]
+        key = (client_id, selected["index"])
+        selected["credit"] -= self._policy_params["credit_w_e"] * selected["n_ext"]
+        self._client_credit[key] = selected["credit"]
+        return selected["index"], score, (
+            0.0, 0.0, selected["hit"], selected["predicted_latency"],
+            selected["hit"], 0.0, len(candidates), len(candidates),
+            stage, int(selected["credit"] <= 0),
+        )
+
     @staticmethod
     def _tiebreak_jitter(request_index, candidate_index):
         """Deterministic hash-based jitter to break ties without systematic bias.
@@ -227,143 +437,99 @@ class Router:
         return int.from_bytes(h[:4], 'little') / 0xFFFFFFFF
 
     def _select_fairroute_candidate(self, schedulers, req_data):
-        client_id = req_data.get('client_id', 'default')
-        request_index = req_data.get('index', 0)
-        total_service = sum(self.fairness_tracker.service.values())
-        clients = set(self.fairness_tracker.service)
-        clients.add(client_id)
-        target = fairness_target(total_service, len(clients))
+        """Route with FairRoute's gate -> slack -> lexicographic pipeline."""
+        client_id = req_data.get("client_id", "default")
+        request_index = req_data.get("index", 0)
+        self._known_clients.add(client_id)
+        target = fairness_target(self._total_service, len(self._known_clients))
         debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
         urgency = fairness_urgency(debt)
+        client_output = self._client_output_ewma.get(client_id, self._global_output_ewma)
+        if self.fairroute_n0:
+            output_estimate = (
+                client_output + self.fairroute_n0 * self._global_output_ewma
+            ) / (1.0 + self.fairroute_n0)
+        else:
+            output_estimate = client_output
+        max_replica_service = max(self._replica_service.values(), default=0.0)
         candidates = []
 
         for index, sched in enumerate(schedulers):
             hit = self._replica_locality(sched, req_data)
-            locality = locality_score(hit, req_data['input_toks'])
-            load, predicted_queue, kv_util = self._replica_prediction(sched)
-            capacity = getattr(sched, 'max_num_seqs', 0)
-            max_queue = max(1, capacity * 4) if capacity not in (0, float('inf')) else float('inf')
+            locality = locality_score(hit, req_data["input_toks"])
+            waiting = len(sched.waiting)
+            running = len(sched.running)
+            capacity = getattr(sched, "max_num_seqs", 0)
+            load = reactive_load(waiting, running, capacity)
+            predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
+            pool = getattr(sched.memory, "npu_pool", None)
+            used_blocks = getattr(pool, "used_blocks", 0) if pool else 0
+            total_blocks = getattr(pool, "num_blocks", 0) if pool else 0
+            kv_util = kv_utilization(used_blocks, total_blocks)
+            max_queue = max(1, capacity * 4) if capacity not in (0, float("inf")) else float("inf")
             safe = replica_is_safe(predicted_queue, max_queue, kv_util)
-            reactive_prediction = load_benefit(load)
-            risk = prediction_risk(predicted_queue, kv_util)
-            predictive = prediction_benefit(risk, max(1.0, capacity or 1.0))
-
+            credit_key = (client_id, index)
+            credit = self._client_credit.setdefault(credit_key, 8192.0)
+            replica_service = self._replica_service.get(index, 0.0)
             candidates.append({
                 "index": index,
                 "safe": safe,
                 "hit": hit,
                 "locality": locality,
-                "prediction": reactive_prediction,
-                "predictive": predictive,
+                "future_locality": locality,
+                "fairness_credit": credit,
+                "replica_deficit": max_replica_service - replica_service,
                 "load": load,
-                "risk": risk,
-                "capacity": capacity,
-                "queue": predicted_queue,
+                "predicted_queue": predicted_queue,
                 "kv_util": kv_util,
+                "predicted_latency": predict_latency_seconds(
+                    load, req_data["input_toks"] - hit, output_estimate),
             })
 
-        # Use magnitude-preserving normalization for composite and FairRoute policies so
-        # absolute scales and gaps are preserved across requests instead of being forced to [0, 1].
-        locality_values = normalize_candidates_magnitude([c["locality"] for c in candidates], higher_is_better=True)
-        prediction_values = normalize_candidates_magnitude([c["prediction"] for c in candidates], higher_is_better=True)
-        load_values = normalize_candidates_magnitude([c["load"] for c in candidates], higher_is_better=False)
+        feasible, slo_risk = fairroute_gate(candidates, ttft_slo=0.1, gamma=1.0)
+        gate_size = len(feasible)
+        mode_by_policy = {
+            "FAIRROUTE_LINEAR": "LINEAR",
+            "FAIRROUTE_MULTIPLICATIVE": "MULTIPLICATIVE",
+            "FAIRROUTE_GATED": "GATED",
+            "FAIRROUTE_LEXICOGRAPHIC": "LEXICOGRAPHIC",
+            "FAIRROUTE_SLACK": "SLACK_LEXICOGRAPHIC",
+            "FAIRROUTE_LEARNED": "LEARNED",
+            "FAIRROUTE": "SLACK_LEXICOGRAPHIC",
+            "FAIRROUTE_V2": "SLACK_LEXICOGRAPHIC",
+            "PRISM": "SLACK_LEXICOGRAPHIC",
+            "D2LPM": "LEARNED",
+        }
+        selected, epsilon = choose_fairroute_candidate(
+            feasible, mode=mode_by_policy[self.routing_policy], urgency=urgency)
+        slack_size = len(feasible)
+        stage = "fallback" if slo_risk else "gate"
+        if epsilon > 0:
+            stage = "slack"
+        if self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
+            stage = f"{stage}:lexicographic"
+        self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+        selected_index = selected["index"]
+        extend_tokens = max(0, req_data["input_toks"] - selected["hit"])
+        self._client_credit[(client_id, selected_index)] -= extend_tokens
+        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
+            for key in list(self._client_credit):
+                if key[0] == client_id:
+                    self._client_credit[key] += 8192.0
 
-        # Per-candidate fairness: urgency * load_headroom.  An underserved
-        # client (high urgency) is steered toward the least-loaded replica;
-        # a well-served client (urgency ≈ 0) lets locality/prediction dominate.
-        fairness_values = [urgency * lb for lb in load_values]
-
-        for index, candidate in enumerate(candidates):
-            locality = locality_values[index]
-            prediction = prediction_values[index]
-            normalized_load_benefit = load_values[index]
-            fairness_benefit = fairness_values[index]
-            combination_args = {
-                "fairness": fairness_benefit,
-                "locality": locality,
-                "prediction": prediction,
-            }
-            policy = self.routing_policy
-            if policy == "FAIRNESS":
-                score = score_combination(**combination_args, components="F")
-            elif policy == "LOCALITY":
-                score = score_combination(**combination_args, components="L")
-            elif policy == "PREDICTION":
-                score = score_combination(**combination_args, components="P")
-            elif policy in {"F_L", "L_P", "F_P", "F_L_P"}:
-                score = score_combination(**combination_args, components=policy.replace("_", ""))
-            elif policy == "PREBLE":
-                score = score_preble(candidate["load"], candidate["risk"], 1.0)
-            elif policy == "LBGR":
-                score = score_lbgr(candidate["hit"], req_data["input_toks"], req_data["output_toks"])
-            elif policy == "DUALMAP":
-                score = score_dualmap(candidate["queue"], 1.0 - locality)
-            elif policy == "CACHE_ROUTE":
-                score = score_cache_route(1.0, max(1.0, candidate["capacity"]), candidate["load"])
-            elif policy == "VTC":
-                score = score_vtc(
-                    client_counter=self.fairness_tracker.get_service(client_id),
-                    input_toks=req_data["input_toks"],
-                    output_toks=req_data["output_toks"],
-                    candidate_load=candidate["load"],
-                )
-            elif policy == "EQUINOX":
-                score = score_equinox(debt, candidate["load"])
-            elif policy == "QUARTZ":
-                score = score_quartz(candidate["queue"], 0.0, debt)
-            elif policy == "ISJL":
-                score = score_combination(**combination_args, components="F") - candidate["queue"] * 0.01
-            elif policy == "NEXUSSCHED":
-                score = score_nexussched(1.0 + candidate["queue"],
-                                         req_data["input_toks"] + req_data["output_toks"])
-            elif policy == "BALANCEROUTE":
-                score = score_balance_route(normalized_load_benefit, candidate["queue"])
-            elif policy == "PILLM":
-                score = score_pillm(req_data["input_toks"], candidate["queue"], req_data["output_toks"])
-            elif policy == "ONLINE_LP":
-                score = score_online_lp(normalized_load_benefit, candidate["queue"], 1.0)
-            elif policy in ("H0", "FAIRROUTE_LINEAR"):
-                score = score_linear(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
-            elif policy == "H1":
-                score = score_multiplicative(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0)
-            elif policy == "H2":
-                beta_h2 = adaptive_locality_weight(1.0, debt, 1.0)
-                score = score_fairness_gated(fairness_benefit, 0.5, locality, prediction, beta=beta_h2)
-            elif policy == "H3":
-                score = score_aflc(fairness_benefit, locality, prediction, 1.0, 1.0, 1.0, debt)
-            elif policy in ("H4", "FAIRROUTE", "FAIRROUTE_GATED"):
-                capacity_val = candidate["capacity"]
-                score = fairroute_score(
-                    debt, urgency, locality, candidate["risk"],
-                    prediction_temperature=max(1.0, capacity_val or 1.0),
-                )
-            elif policy in ("H5", "FAIRROUTE_V2"):
-                score = score_fairroute_v2(
-                    debt=debt,
-                    urgency=urgency,
-                    locality=locality,
-                    prediction=prediction,
-                    normalized_load_benefit=normalized_load_benefit,
-                )
-            else:
-                score = score_combination(**combination_args, components="FLP")
-            candidate["score"] = score
-
-        safe_candidates = [candidate for candidate in candidates if candidate["safe"]]
-        pool = safe_candidates or candidates
-        # Use deterministic hash jitter for tie-breaking instead of -index
-        # to avoid systematic hotspotting on the lowest-index instance.
-        sorted_candidates = sorted(
-            pool,
-            key=lambda c: (c["score"], self._tiebreak_jitter(request_index, c["index"])),
-            reverse=True,
-        )
-        selected = sorted_candidates[0]
-        margin = (selected["score"] - sorted_candidates[1]["score"]) if len(sorted_candidates) > 1 else 0.0
-        self._routed_scores.append(selected["score"])
+        alternatives = sorted(candidate["predicted_latency"] for candidate in feasible)
+        margin = (alternatives[1] - alternatives[0]) if len(alternatives) > 1 else 0.0
+        score = -selected["predicted_latency"]
+        if slo_risk:
+            score -= 0.001
+        self._routed_scores.append(score)
         self._routed_margins.append(margin)
-        return selected["index"], selected["score"], (
-            debt, urgency, selected["locality"], selected["prediction"], selected["hit"], margin
+        credit_exhausted = self._client_credit[(client_id, selected_index)] <= 0
+        return selected_index, score, (
+            debt, urgency, selected["locality"],
+            1.0 / max(selected["predicted_latency"], 1e-8),
+            selected["hit"], margin, gate_size, slack_size, stage,
+            int(credit_exhausted),
         )
 
     def get_score_stats(self):
@@ -388,6 +554,35 @@ class Router:
             "margin_std": std_margin,
             "count": n,
         }
+
+    def get_decision_diagnostics(self):
+        """Return aggregate routing timing and stage data for a run."""
+        values = sorted(self._decision_times_ns)
+        if not values:
+            percentiles = {"p50": 0, "p95": 0, "p99": 0}
+        else:
+            def percentile(fraction):
+                return values[min(len(values) - 1, int((len(values) - 1) * fraction))]
+            percentiles = {
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "p99": percentile(0.99),
+            }
+        return {
+            "count": len(values),
+            "decision_ns": percentiles,
+            "stage_counts": dict(self._routing_stage_counts),
+            "policy": self.routing_policy,
+            "fairroute_n0": self.fairroute_n0,
+        }
+
+    def save_diagnostics(self, output_file):
+        """Write aggregate routing diagnostics beside a result CSV."""
+        if not output_file:
+            return
+        target = output_file if os.path.isabs(output_file) else f"../{output_file}"
+        with open(f"{target}.routing.json", "w", encoding="utf-8") as handle:
+            json.dump(self.get_decision_diagnostics(), handle, indent=2)
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -495,6 +690,7 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
+            started_ns = time.perf_counter_ns()
             if self.routing_policy == "CUSTOM":
                 instance_id, route_score, route_metrics = self._custom_select(
                     self.prefill_schedulers, "prefill", req_data)
@@ -505,6 +701,8 @@ class Router:
                 instance_id = self._select_instance(self.prefill_schedulers, "prefill")
                 route_score = 0.0
                 route_metrics = (0.0, 0.0, 0.0, 0.0, 0)
+            decision_ns = time.perf_counter_ns() - started_ns
+            self._decision_times_ns.append(decision_ns)
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
@@ -524,15 +722,29 @@ class Router:
                 ], is_init=self._is_init)
 
             new_req.routing_policy = self.routing_policy
+            new_req.session_id = req_data.get('session_id')
+            new_req.sub_request_index = req_data.get('sub_request_index')
             new_req.routing_score = route_score
             (new_req.routing_fairness_debt,
              new_req.routing_fairness_urgency,
              new_req.routing_locality,
              new_req.routing_prediction,
              _,
-             new_req.routing_score_margin) = route_metrics if len(route_metrics) >= 6 else (*route_metrics, 0.0)[:6]
+             new_req.routing_score_margin,
+             *routing_details) = route_metrics if len(route_metrics) >= 6 else (*route_metrics, 0.0)[:6]
+            new_req.routing_decision_ns = decision_ns
+            if len(routing_details) >= 4:
+                new_req.routing_gate_size = int(routing_details[0])
+                new_req.routing_slack_size = int(routing_details[1])
+                new_req.routing_stage = str(routing_details[2])
+                new_req.routing_credit_exhausted = bool(routing_details[3])
             self._request_clients[new_req.id] = new_req.client_id
             self._request_service[new_req.id] = new_req.output - new_req.input
+            self._request_arrivals[new_req.id] = new_req.arrival
+            self._request_instances[new_req.id] = instance_id
+            self._request_output_estimates[new_req.id] = self._client_output_estimate(
+                new_req.client_id
+            )
 
             self._pending_idx += 1
             routed += 1
@@ -562,13 +774,38 @@ class Router:
         session_info = self._request_to_session.pop(request_id, None)
         client_id = self._request_clients.pop(request_id, 'default')
         service = self._request_service.pop(request_id, 0)
+        arrival = self._request_arrivals.pop(request_id, completion_time_ns)
+        instance_id = self._request_instances.pop(request_id, None)
+        expected_output = self._request_output_estimates.pop(
+            request_id, self._global_output_ewma
+        )
         self.fairness_tracker.record_service(client_id, service)
-        # Record per-client latency for routing-sensitive Jain's Index.
-        # completion_time_ns is absolute; retrieve arrival from the request
-        # object if possible, otherwise just record the service amount as a
-        # latency proxy (output tokens served correlate with wall time).
-        if hasattr(self.fairness_tracker, 'record_latency'):
-            self.fairness_tracker.record_latency(client_id, float(service))
+        self._total_service += service
+        previous_output = self._client_output_ewma.get(client_id, float(service))
+        self._client_output_ewma[client_id] = 0.1 * float(service) + 0.9 * previous_output
+        self._global_output_samples.append(float(service))
+        self._global_output_samples = self._global_output_samples[-101:]
+        ordered = sorted(self._global_output_samples)
+        self._global_output_ewma = ordered[len(ordered) // 2]
+        delay = float(completion_time_ns - arrival)
+        previous_delay = self._client_delay_ewma.get(client_id, delay)
+        self._client_delay_ewma[client_id] = 0.05 * delay + 0.95 * previous_delay
+        self._global_delay_ewma = 0.05 * delay + 0.95 * self._global_delay_ewma
+        if instance_id is not None and self.routing_policy in {"D2LPM", "FAIRROUTE", "FAIRROUTE_V2"}:
+            key = (client_id, instance_id)
+            if self.routing_policy == "D2LPM":
+                self._client_credit[key] = self._client_credit.get(key, 0.0) - (
+                    self._policy_params["credit_w_q"] * service
+                )
+            elif self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
+                self._replica_service[instance_id] = (
+                    self._replica_service.get(instance_id, 0.0)
+                    + self._policy_params["credit_w_q"] * (service - expected_output)
+                )
+        if instance_id is not None:
+            if self.routing_policy not in {"FAIRROUTE", "FAIRROUTE_V2"}:
+                self._replica_service[instance_id] = self._replica_service.get(instance_id, 0.0) + service
+        self.fairness_tracker.record_latency(client_id, float(completion_time_ns - arrival))
         if session_info is None:
             return
         session_id, completed_idx = session_info

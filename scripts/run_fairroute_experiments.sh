@@ -3,14 +3,14 @@
 #
 # Unified entry point for the two FairRoute experiment drivers that used to be
 # separate scripts:
-#   - scripts/run_fairroute_hypothesis_matrix.sh  (the 29-policy x 6-scenario matrix)
+#   - the FairRoute policy matrix (3 baselines + explicit FairRoute forms)
 #   - scripts/run_client_sweep.sh                 (client-count scalability sweep)
 #
 # Usage:
 #   ./scripts/run_fairroute_experiments.sh <matrix|sweep|all> [--detach|--status|--logs|--stop]
 #
 # Examples:
-#   ./scripts/run_fairroute_experiments.sh matrix              # run the policy matrix in the foreground
+#   ./scripts/run_fairroute_experiments.sh matrix              # run every workload under workloads/fairroute
 #   ./scripts/run_fairroute_experiments.sh sweep --detach       # run the client sweep in the background
 #   ./scripts/run_fairroute_experiments.sh all --detach         # run matrix, then sweep, in the background
 #   ./scripts/run_fairroute_experiments.sh all --status         # status of both stages
@@ -42,26 +42,33 @@ ACTION="${1:-}"
 # Configuration (shared)
 # ---------------------------------------------------------------------------
 CONTAINER="${CONTAINER:-servingsim_docker}"
+DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-4}"
+# Per-simulation wall-clock timeout in seconds (0 = no timeout).
+# Protects the run from a single hung simulation stalling the entire matrix.
+SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
-MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute_hypothesis}"
-MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute_hypothesis}"
-MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-1000}"
-INCLUDE_REAL_WORKLOAD="${INCLUDE_REAL_WORKLOAD:-1}"
+MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute}"
+MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute}"
+MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"
+MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
+MATRIX_SEED="${MATRIX_SEED:-42}"
+MATRIX_WORKLOAD_SCENARIOS="${MATRIX_WORKLOAD_SCENARIOS:-c0_calibration,balanced_control,locality_conflict,fairness_conflict,prediction_burst,full_adversarial,u5_vtc_as_published,w2_heavy_light,w4_flooding,u2_multiturn,u3_loogle_proxy}"
+GENERATE_WORKLOADS="${GENERATE_WORKLOADS:-0}"
+INCLUDE_REAL_WORKLOAD="${INCLUDE_REAL_WORKLOAD:-0}"
 REAL_WORKLOAD="${REAL_WORKLOAD:-workloads/workload-llama8b-full-sps10-100clients.jsonl}"
 REAL_WORKLOAD_LIMIT="${REAL_WORKLOAD_LIMIT:-1000}"
 MATRIX_STATUS_FILE="${MATRIX_STATUS_FILE:-$MATRIX_OUTPUT_DIR/matrix_status.txt}"
 MATRIX_LOG_FILE="${MATRIX_LOG_FILE:-$MATRIX_OUTPUT_DIR/matrix.log}"
 MATRIX_POLICIES=(
   RR LOAD RAND
-  FAIRNESS LOCALITY PREDICTION F_L L_P F_P F_L_P
-  PREBLE LBGR DUALMAP CACHE_ROUTE VTC EQUINOX QUARTZ ISJL
-  NEXUSSCHED BALANCEROUTE PILLM ONLINE_LP
-  H0 H1 H2 H3 H4 H5 FAIRROUTE FAIRROUTE_V2
+  FAIRROUTE FAIRROUTE_V2 FAIRROUTE_LINEAR FAIRROUTE_MULTIPLICATIVE
+  FAIRROUTE_GATED FAIRROUTE_LEXICOGRAPHIC FAIRROUTE_SLACK FAIRROUTE_LEARNED
+  PRISM D2LPM
 )
 
 # --- Sweep-specific (was scripts/run_client_sweep.sh) -----------------------
@@ -72,7 +79,9 @@ SWEEP_NUM_REQS="${SWEEP_NUM_REQS:-500}"
 SWEEP_STATUS_FILE="${SWEEP_STATUS_FILE:-$SWEEP_OUTPUT_DIR/sweep_status.txt}"
 SWEEP_LOG_FILE="${SWEEP_LOG_FILE:-$SWEEP_OUTPUT_DIR/sweep.log}"
 CLIENT_COUNTS=(5 10 20 50 100 200)
-SWEEP_POLICIES=(FAIRROUTE_V2 LOAD LOCALITY FAIRNESS PREBLE H0 H1 H4)
+SWEEP_POLICIES=(
+  FAIRROUTE_V2 LOAD RR RAND FAIRROUTE_GATED FAIRROUTE_SLACK FAIRROUTE_LEARNED
+)
 
 # --- Combined-run control files (used only for MODE=all) -------------------
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-outputs/run_all}"
@@ -93,6 +102,28 @@ case "$MODE" in
   sweep)  _STATUS_FILE="$SWEEP_STATUS_FILE";  _LOG_FILE="$SWEEP_LOG_FILE";  _PID_FILE="$SWEEP_OUTPUT_DIR/sweep.pid" ;;
   all)    _STATUS_FILE="$STATUS_FILE";        _LOG_FILE="$LOG_FILE";       _PID_FILE="$PID_FILE" ;;
 esac
+
+check_writable_dir() {
+  local path="$1"
+  mkdir -p "$path" 2>/dev/null || {
+    echo "Cannot create experiment directory: $path" >&2
+    return 1
+  }
+  local probe
+  probe=$(mktemp "$path/.write_probe.XXXXXX" 2>/dev/null) || {
+    local fs_type
+    fs_type=$(stat -f -c '%T' "$path" 2>/dev/null || printf 'unknown')
+    cat >&2 <<EOF
+Cannot create files in '$path' (filesystem: $fs_type).
+The filesystem is reporting ENOSPC despite having free bytes. This is a
+problem with the NTFS/FUSE mount, not Docker memory or simulator concurrency.
+Remount the volume, or move this repository to a native Linux filesystem
+(for example under /home), then rerun the experiment.
+EOF
+    return 1
+  }
+  rm -f "$probe"
+}
 
 case "$ACTION" in
   --detach)
@@ -135,26 +166,51 @@ case "$ACTION" in
     exit 0
     ;;
   --stop)
-    if docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
-      docker exec -i "$CONTAINER" bash -s <<'STOP_SCRIPT'
-  set +e
-  for pid in $(pgrep -f 'python3 -m serving' 2>/dev/null); do
-    command_line=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)
-    if [[ "$command_line" == *"fairroute_hypothesis"* || "$command_line" == *"client_sweep"* ]]; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
-STOP_SCRIPT
-    fi
+    echo "Forcefully stopping all FairRoute '$MODE' processes (host & container) and cleaning stale data..."
+
+    # 1. Kill host-side script processes and docker exec commands
     for f in "$_PID_FILE" "$MATRIX_OUTPUT_DIR/matrix.pid" "$SWEEP_OUTPUT_DIR/sweep.pid"; do
       if [[ -f "$f" ]]; then
         host_pid=$(cat "$f")
-        kill -TERM "$host_pid" 2>/dev/null || true
+        if kill -0 "$host_pid" 2>/dev/null; then
+          kill -9 "$host_pid" 2>/dev/null || true
+        fi
         rm -f "$f"
       fi
     done
-    printf '%s status=STOPPED\n' "$(date -Is)" >"$_STATUS_FILE"
-    echo "Stopped FairRoute '$MODE' workers. Docker container remains running."
+    pkill -9 -f "run_fairroute_experiments.sh" 2>/dev/null || true
+    pkill -9 -f "docker exec.*$CONTAINER" 2>/dev/null || true
+
+    # 2. Kill processes inside container (python frontend, C++ ASTRA-Sim backend, bash loops)
+    if docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
+      docker exec -i --user 0 "$CONTAINER" bash -s <<'STOP_SCRIPT'
+  set +e
+  pkill -9 -f 'python3' 2>/dev/null || true
+  pkill -9 -f 'AnalyticalAstra' 2>/dev/null || true
+  pkill -9 -f 'generate_hypothesis_workloads' 2>/dev/null || true
+  pkill -9 -f 'bash -s' 2>/dev/null || true
+STOP_SCRIPT
+    fi
+
+    # 3. Clean stale data & orphaned state
+    rm -rf astra-sim/inputs/runs/* 2>/dev/null || true
+
+    for state_dir in "$MATRIX_OUTPUT_DIR/.matrix_state" "$SWEEP_OUTPUT_DIR/.sweep_state"; do
+      if [[ -d "$state_dir" ]]; then
+        rm -rf "$state_dir" 2>/dev/null || true
+      fi
+    done
+    find "$MATRIX_OUTPUT_DIR" "$SWEEP_OUTPUT_DIR" "$RUN_ROOT_DIR" -name '*.tmp.*' -delete 2>/dev/null || true
+
+    # 4. Update status files to STOPPED
+    for sf in "$_STATUS_FILE" "$MATRIX_STATUS_FILE" "$SWEEP_STATUS_FILE" "$STATUS_FILE"; do
+      if [[ -n "$sf" ]]; then
+        mkdir -p "$(dirname "$sf")" 2>/dev/null || true
+        printf '%s status=STOPPED\n' "$(date -Is)" >"$sf" 2>/dev/null || true
+      fi
+    done
+
+    echo "Forcefully stopped all FairRoute '$MODE' processes and cleaned stale trace/state data."
     exit 0
     ;;
   "")
@@ -168,6 +224,16 @@ esac
 # ---------------------------------------------------------------------------
 # Docker container check (shared)
 # ---------------------------------------------------------------------------
+case "$MODE" in
+  matrix) check_writable_dir "$MATRIX_OUTPUT_DIR" ;;
+  sweep) check_writable_dir "$SWEEP_OUTPUT_DIR" ;;
+  all)
+    check_writable_dir "$RUN_ROOT_DIR"
+    check_writable_dir "$MATRIX_OUTPUT_DIR"
+    check_writable_dir "$SWEEP_OUTPUT_DIR"
+    ;;
+esac
+
 if ! docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
   echo "Container '$CONTAINER' is not running. Starting container..."
   docker start "$CONTAINER"
@@ -178,26 +244,45 @@ fi
 # ---------------------------------------------------------------------------
 run_matrix_stage() {
   mkdir -p "$MATRIX_OUTPUT_DIR"
+  matrix_fs_type=$(stat -f -c '%T' "$MATRIX_OUTPUT_DIR" 2>/dev/null || printf 'unknown')
+  echo "Output filesystem type: $matrix_fs_type"
   printf '%s status=RUNNING stage=matrix container=%s\n' "$(date -Is)" "$CONTAINER" >"$MATRIX_STATUS_FILE"
 
   docker exec \
     -i \
+    --user "$DOCKER_USER" \
     -e "CONFIG=$CONFIG" \
     -e "WORKLOAD_DIR=$MATRIX_WORKLOAD_DIR" \
     -e "OUTPUT_DIR=$MATRIX_OUTPUT_DIR" \
     -e "NUM_REQS=$MATRIX_NUM_REQS" \
+    -e "NUM_CLIENTS=$MATRIX_NUM_CLIENTS" \
+    -e "GENERATOR_SEED=$MATRIX_SEED" \
+    -e "WORKLOAD_SCENARIOS=$MATRIX_WORKLOAD_SCENARIOS" \
+    -e "GENERATE_WORKLOADS=$GENERATE_WORKLOADS" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
     -e "INCLUDE_REAL_WORKLOAD=$INCLUDE_REAL_WORKLOAD" \
     -e "REAL_WORKLOAD=$REAL_WORKLOAD" \
     -e "REAL_WORKLOAD_LIMIT=$REAL_WORKLOAD_LIMIT" \
+    -e "MATRIX_NUM_REQS=$MATRIX_NUM_REQS" \
     -e "CACHE_MODE=$CACHE_MODE" \
     -e "STATUS_FILE=$MATRIX_STATUS_FILE" \
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
 set -euo pipefail
 cd /app/LLMServingSim
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" log astra-sim/inputs/runs
+chmod 777 log astra-sim/inputs/runs 2>/dev/null || true
 printf '%s status=RUNNING container=%s\n' "$(date -Is)" "$HOSTNAME" >"$STATUS_FILE"
+
+if [[ "$GENERATE_WORKLOADS" == "1" ]]; then
+  echo "Generating FairRoute workloads: scenarios=$WORKLOAD_SCENARIOS seed=$GENERATOR_SEED clients=$NUM_CLIENTS"
+  python3 -m workloads.generators.generate_hypothesis_workloads \
+    --output-dir "$WORKLOAD_DIR" \
+    --num-reqs "$NUM_REQS" \
+    --num-clients "$NUM_CLIENTS" \
+    --seed "$GENERATOR_SEED" \
+    --scenarios "$WORKLOAD_SCENARIOS"
+fi
 
 case "$CACHE_MODE" in
   xpu) CACHE_ARGS=() ;;
@@ -224,16 +309,16 @@ fi
 
 POLICIES=(
   RR LOAD RAND
-  FAIRNESS LOCALITY PREDICTION F_L L_P F_P F_L_P
-  PREBLE LBGR DUALMAP CACHE_ROUTE VTC EQUINOX QUARTZ ISJL
-  NEXUSSCHED BALANCEROUTE PILLM ONLINE_LP
-  H0 H1 H2 H3 H4 H5 FAIRROUTE FAIRROUTE_V2
+  FAIRROUTE FAIRROUTE_V2 FAIRROUTE_LINEAR FAIRROUTE_MULTIPLICATIVE
+  FAIRROUTE_GATED FAIRROUTE_LEXICOGRAPHIC FAIRROUTE_SLACK FAIRROUTE_LEARNED
+  PRISM D2LPM
 )
 
-shopt -s nullglob
-datasets=("$WORKLOAD_DIR"/*.jsonl)
+mapfile -d '' datasets < <(
+  find "$WORKLOAD_DIR" -type f -name '*.jsonl' -print0 | sort -z
+)
 if (( ${#datasets[@]} == 0 )); then
-  echo "No JSONL workloads found in $WORKLOAD_DIR." >&2
+  echo "No JSONL workloads found recursively under $WORKLOAD_DIR." >&2
   exit 3
 fi
 
@@ -267,7 +352,8 @@ run_policy() {
   local scenario="$2"
   local policy="$3"
   local output="$OUTPUT_DIR/${scenario}_policy_${policy}.csv"
-  local state_key="${scenario}__${policy}"
+  local state_key="${scenario//\//__}__${policy}"
+  local run_key="${scenario//\//__}"
   local state_file="$STATE_DIR/$state_key.running"
   local expected_rows actual_rows
 
@@ -287,17 +373,27 @@ run_policy() {
   fi
 
   echo "=== RUN $scenario / $policy ==="
-  if python3 -m serving \
+  mkdir -p "$(dirname "$output")"
+  local timeout_prefix=()
+  if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
+    timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
+  fi
+  if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
+      --run-id "fairroute_${run_key}_${policy}_${BASHPID}" \
       --output "$output" \
       --log-level WARNING; then
     mv -f "$state_file" "$STATE_DIR/$state_key.done"
     write_status RUNNING "$scenario/$policy"
   else
+    local exit_code=$?
+    if [[ $exit_code -eq 124 ]]; then
+      echo "=== TIMEOUT $scenario / $policy (${SIM_TIMEOUT}s) ==" >&2
+    fi
     mv -f "$state_file" "$STATE_DIR/$state_key.failed"
     write_status FAILED "$scenario/$policy"
     return 1
@@ -307,7 +403,7 @@ run_policy() {
 running_jobs=0
 failed_jobs=0
 for dataset in "${datasets[@]}"; do
-  scenario="${dataset##*/}"
+  scenario="${dataset#"$WORKLOAD_DIR"/}"
   scenario="${scenario%.jsonl}"
   for policy in "${POLICIES[@]}"; do
     run_policy "$dataset" "$scenario" "$policy" &
@@ -340,10 +436,13 @@ CONTAINER_SCRIPT
 # ---------------------------------------------------------------------------
 run_sweep_stage() {
   mkdir -p "$SWEEP_OUTPUT_DIR" "$SWEEP_WORKLOAD_DIR" "$SWEEP_PLOTS_DIR"
+  sweep_fs_type=$(stat -f -c '%T' "$SWEEP_OUTPUT_DIR" 2>/dev/null || printf 'unknown')
+  echo "Output filesystem type: $sweep_fs_type"
   printf '%s status=RUNNING stage=sweep container=%s\n' "$(date -Is)" "$CONTAINER" >"$SWEEP_STATUS_FILE"
 
   docker exec \
     -i \
+    --user "$DOCKER_USER" \
     -e "CONFIG=$CONFIG" \
     -e "WORKLOAD_DIR=$SWEEP_WORKLOAD_DIR" \
     -e "OUTPUT_DIR=$SWEEP_OUTPUT_DIR" \
@@ -356,11 +455,12 @@ run_sweep_stage() {
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
 set -euo pipefail
 cd /app/LLMServingSim
-mkdir -p "$OUTPUT_DIR" "$WORKLOAD_DIR" "$PLOTS_DIR"
+mkdir -p "$OUTPUT_DIR" "$WORKLOAD_DIR" "$PLOTS_DIR" log astra-sim/inputs/runs
+chmod 777 log astra-sim/inputs/runs 2>/dev/null || true
 printf '%s status=RUNNING container=%s\n' "$(date -Is)" "$HOSTNAME" >"$STATUS_FILE"
 
 CLIENT_COUNTS=(5 10 20 50 100 200)
-POLICIES=(FAIRROUTE_V2 LOAD LOCALITY FAIRNESS PREBLE H0 H1 H4)
+POLICIES=(FAIRROUTE_V2 LOAD RR RAND FAIRROUTE_GATED FAIRROUTE_SLACK FAIRROUTE_LEARNED)
 
 case "$CACHE_MODE" in
   xpu) CACHE_ARGS=() ;;
@@ -436,17 +536,26 @@ run_policy() {
   fi
 
   echo "=== RUN clients=$n_clients / scenario=$scenario / policy=$policy ==="
-  if python3 -m serving \
+  local timeout_prefix=()
+  if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
+    timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
+  fi
+  if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
+      --run-id "fairroute_sweep_c${n_clients}_${scenario}_${policy}_${BASHPID}" \
       --output "$output" \
       --log-level WARNING; then
     mv -f "$state_file" "$STATE_DIR/$state_key.done"
     write_status RUNNING "c${n_clients}/${scenario}/${policy}"
   else
+    local exit_code=$?
+    if [[ $exit_code -eq 124 ]]; then
+      echo "=== TIMEOUT clients=$n_clients/$scenario/$policy (${SIM_TIMEOUT}s) ==" >&2
+    fi
     mv -f "$state_file" "$STATE_DIR/$state_key.failed"
     write_status FAILED "c${n_clients}/${scenario}/${policy}"
     return 1

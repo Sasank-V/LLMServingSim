@@ -1,4 +1,5 @@
 import re
+import select
 from .logger import get_logger
 
 # ASTRA-Sim's per-iteration report, the one line of its stdout the frontend
@@ -9,6 +10,12 @@ _ITERATION_RE = re.compile(
     r"exposed communication (\d+) cycles."
 )
 
+# How long (seconds) to wait for a line from ASTRA-Sim before re-checking
+# whether the subprocess has died.  Not a hard timeout on the whole handshake —
+# we only raise after the process has actually exited or produced no output for
+# this interval while already dead.
+_POLL_INTERVAL_S = 5.0
+
 
 class Controller():
     def __init__(self, total_num):
@@ -18,27 +25,45 @@ class Controller():
         for i in range(total_num):
             self.end_dict[i] = -1
 
+    def _readline_with_death_check(self, p, context="read_wait"):
+        """Read one line from p.stdout, raising RuntimeError if ASTRA-Sim dies."""
+        line = p.stdout.readline()
+        if line == "" and p.poll() is not None:
+            stderr_tail = ""
+            try:
+                stderr_tail = p.stderr.read(4096) if p.stderr else ""
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"ASTRA-Sim subprocess exited unexpectedly "
+                f"(rc={p.returncode}) during {context}."
+                + (f"\nstderr: {stderr_tail.strip()}" if stderr_tail.strip() else "")
+            )
+        return line
 
     def read_wait(self, p):
-        """Read ASTRA-Sim's stdout up to the "Waiting" prompt.
+        """Read ASTRA-Sim's stdout up to the \"Waiting\" prompt.
 
         Every line before the prompt is the iteration report; ASTRA-Sim used
-        to interleave a per-tick "Checking ..." line per NPU, which made this
+        to interleave a per-tick \"Checking ...\" line per NPU, which made this
         loop 3.07M reads on a 10-request 8-NPU run against 675k now. See the
         ASTRA_SIM_TRACE_POLLING note in the analytical backend's main.cc.
+
+        Uses _readline_with_death_check so a crashed or stalled ASTRA-Sim
+        process raises a clear RuntimeError instead of hanging forever.
         """
         out = [""]
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
-            line = p.stdout.readline()
+            line = self._readline_with_death_check(p, context="read_wait")
             # For debugging
-            # print(line, end='')
+            self.logger.debug("[ASTRA OUT] %r", line)
             out.append(line)
         return out
 
     def check_end(self, p):
         out = ["",""]
         while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
+            out.append(self._readline_with_death_check(p, context="check_end"))
             p.stdout.flush()
         print(out[-4], end='')
         print(out[-2], end='')

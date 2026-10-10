@@ -107,6 +107,21 @@ and the format reference is
 
 ## Generating workloads
 
+To convert every supported dataset already present under
+`workloads/datasets/raw/` and build the deterministic W3 scaling proxy grid,
+use:
+
+```bash
+./scripts/generate_fairroute_workloads.sh all
+```
+
+Converted JSONL traces are written under `workloads/fairroute_converted/`;
+scaling traces are written under `workloads/fairroute/scaling/`. Use
+`convert` or `scaling` to run one stage only. The wrapper also supports
+`--detach`, `--status`, `--logs`, and `--stop`. Configuration is supplied
+through environment variables such as `NUM_CLIENTS`, `SEED`, `DATASETS`,
+`N_REQUESTS`, and `PYTHON_CMD`.
+
 Workloads are produced via the `generators/` subpackage, which uses the
 target model's tokenizer to populate `input_tok_ids` (so prefix-cache
 hashes are stable) and Poisson-distributed arrivals at the requested
