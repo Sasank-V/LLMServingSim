@@ -29,7 +29,8 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 CONTAINER="${CONTAINER:-servingsim_docker}"
-CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
+# Default to high-saturation cluster config to expose queueing bottlenecks
+CONFIG="${CONFIG:-configs/cluster/high_saturation_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-4}"
@@ -339,13 +340,15 @@ for fpath in files:
     with open(fpath) as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # Normalize column names to lowercase
+            lower_row = {k.strip().lower(): v for k, v in row.items() if k}
             try:
-                if 'latency' in row and row['latency']:
-                    latencies.append(float(row['latency']))
-                if 'ttft' in row and row['ttft']:
-                    ttfts.append(float(row['ttft']))
-                if 'tpot' in row and row['tpot']:
-                    tpots.append(float(row['tpot']))
+                if 'latency' in lower_row and lower_row['latency']:
+                    latencies.append(float(lower_row['latency']))
+                if 'ttft' in lower_row and lower_row['ttft']:
+                    ttfts.append(float(lower_row['ttft']))
+                if 'tpot' in lower_row and lower_row['tpot']:
+                    tpots.append(float(lower_row['tpot']))
             except (ValueError, KeyError):
                 continue
 
