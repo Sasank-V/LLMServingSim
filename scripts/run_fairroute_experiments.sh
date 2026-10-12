@@ -45,15 +45,15 @@ CONTAINER="${CONTAINER:-servingsim_docker}"
 DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
-SKIP_EXISTING="${SKIP_EXISTING:-0}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-6}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # Per-simulation wall-clock timeout in seconds (0 = no timeout).
 # Protects the run from a single hung simulation stalling the entire matrix.
 SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
-MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute}"
+MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/main}"
 MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
 MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute}"
 MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"

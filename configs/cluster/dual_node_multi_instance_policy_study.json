@@ -20,7 +20,6 @@
             "mem_latency": 0,
             "mem_util": 0.90
           },
-          "max_num_seqs": 16,
           "pd_type": null,
           "tp_size": 1
         },
@@ -33,7 +32,6 @@
             "mem_latency": 0,
             "mem_util": 0.90
           },
-          "max_num_seqs": 16,
           "pd_type": null,
           "tp_size": 1
         }
@@ -56,7 +54,6 @@
             "mem_latency": 0,
             "mem_util": 0.90
           },
-          "max_num_seqs": 16,
           "pd_type": null,
           "tp_size": 1
         },
@@ -69,7 +66,6 @@
             "mem_latency": 0,
             "mem_util": 0.90
           },
-          "max_num_seqs": 16,
           "pd_type": null,
           "tp_size": 1
         }
