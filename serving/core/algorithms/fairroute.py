@@ -71,17 +71,71 @@ def fairroute_slack_set(candidates, rho=0.25, eps_max=0.05, urgency=0.0):
     ], epsilon
 
 
+def _candidate_load_headrooms(candidates):
+    """Return normalised load headroom in [0, 1] for each candidate.
+
+    Headroom 1.0 = least-loaded replica; 0.0 = most-loaded.  When all
+    candidates share the same load, every headroom is 0.5.  The ``load``
+    key is read from each candidate dict and defaults to 0.0 when absent,
+    so the function is safe to call on candidates from any source.
+    """
+    loads = [c.get("load", 0.0) for c in candidates]
+    l_min, l_max = min(loads), max(loads)
+    span = l_max - l_min
+    if span < 1e-8:
+        return [0.5] * len(candidates)
+    return [(l_max - l) / span for l in loads]
+
+
 def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
                                urgency=0.0, rho=0.25, eps_max=0.05):
-    """Choose a candidate using one FairRoute combination form."""
+    """Choose a candidate using one FairRoute combination form.
+
+    Every scoring mode incorporates **both** replica-level and client-level
+    fairness signals:
+
+    * **Replica-level fairness** (``replica_deficit``): balances accumulated
+      service across replica instances so no single instance is over-burdened.
+    * **Client-level fairness** (``urgency * load_headroom``): steers
+      underserved clients (high ``urgency``) toward less-loaded replicas,
+      ensuring no client is starved regardless of which replica is chosen.
+
+    The client fairness term is candidate-varying: the least-loaded replica
+    gets headroom=1, the most-loaded gets 0, so the signal genuinely
+    differentiates replicas.  When ``urgency`` is 0.0 (well-served client)
+    the client-level contribution is zero and the formula reduces to the
+    replica-only form.  When ``urgency`` is 1.0 (starved client) the pull
+    toward low-load replicas is maximal.
+
+    Candidates must carry a ``load`` key (normalised replica load from
+    ``reactive_load``); when absent a headroom of 0.5 is assumed.
+    """
     if not candidates:
         raise ValueError("FairRoute requires at least one candidate")
 
     mode = mode.upper()
+    urgency = max(0.0, min(1.0, float(urgency)))
+
+    # Build a per-candidate client-level fairness signal.
+    # Normalising across the candidate set makes the signal candidate-varying
+    # even though ``urgency`` is a single per-client scalar.
+    # An identity-keyed dict avoids mutating the caller's dicts while remaining
+    # correct after list-comprehension filtering (Python preserves object
+    # identity in list comprehensions, so id(item) still matches).
+    headrooms = _candidate_load_headrooms(candidates)
+    cf = {id(c): urgency * h for c, h in zip(candidates, headrooms)}
+
     if mode == "GATED":
         pool = candidates
         epsilon = 0.0
-        selected = min(pool, key=lambda item: item["predicted_latency"])
+        # Prefer low latency; break ties by favouring the less-loaded replica
+        # when the client is underserved (urgency > 0).
+        selected = max(
+            pool,
+            key=lambda item: (
+                cf[id(item)] - item["predicted_latency"]
+            ),
+        )
     elif mode == "MULTIPLICATIVE":
         pool = candidates
         epsilon = 0.0
@@ -91,7 +145,8 @@ def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
             key=lambda item: (
                 item["predicted_latency"] / max(1e-8, best_latency)
                 * (1.0 + item["locality"])
-                / max(1e-8, 1.0 + item["replica_deficit"])
+                / max(1e-8, 1.0 + item["replica_deficit"])  # replica-level
+                / max(1e-8, 1.0 + cf[id(item)])             # client-level
             ),
         )
     elif mode == "LINEAR":
@@ -102,7 +157,8 @@ def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
             key=lambda item: (
                 -item["predicted_latency"]
                 + 0.02 * item["locality"]
-                + 0.01 * item["replica_deficit"]
+                + 0.01 * item["replica_deficit"]  # replica-level fairness
+                + 0.05 * cf[id(item)]             # client-level fairness
             ),
         )
     elif mode == "LEARNED":
@@ -113,8 +169,9 @@ def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
             key=lambda item: (
                 -item["predicted_latency"]
                 + 0.01 * item["locality"]
-                + 0.01 * item["replica_deficit"]
+                + 0.01 * item["replica_deficit"]   # replica-level fairness
                 + 0.01 * item["fairness_credit"]
+                + 0.02 * cf[id(item)]              # client-level fairness
             ),
         )
     else:
@@ -132,7 +189,8 @@ def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
             key=lambda item: (
                 item["locality"],
                 item["future_locality"],
-                item["replica_deficit"],
+                cf[id(item)],              # client-level fairness
+                item["replica_deficit"],   # replica-level fairness
                 -item["predicted_latency"],
             ),
         )

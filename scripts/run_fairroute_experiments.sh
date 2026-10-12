@@ -45,14 +45,16 @@ CONTAINER="${CONTAINER:-servingsim_docker}"
 DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
-SKIP_EXISTING="${SKIP_EXISTING:-0}"
-PARALLEL_JOBS="${PARALLEL_JOBS:-4}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-6}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 # Per-simulation wall-clock timeout in seconds (0 = no timeout).
 # Protects the run from a single hung simulation stalling the entire matrix.
 SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
-MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute}"
+MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/main}"
+MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
 MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute}"
 MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"
 MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
@@ -183,13 +185,7 @@ case "$ACTION" in
 
     # 2. Kill processes inside container (python frontend, C++ ASTRA-Sim backend, bash loops)
     if docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
-      docker exec -i --user 0 "$CONTAINER" bash -s <<'STOP_SCRIPT'
-  set +e
-  pkill -9 -f 'python3' 2>/dev/null || true
-  pkill -9 -f 'AnalyticalAstra' 2>/dev/null || true
-  pkill -9 -f 'generate_hypothesis_workloads' 2>/dev/null || true
-  pkill -9 -f 'bash -s' 2>/dev/null || true
-STOP_SCRIPT
+      docker exec -i --user 0 "$CONTAINER" bash -c 'for p in $(ps -eo pid=); do if [ "$p" -gt 1 ] && [ "$p" -ne "$$" ]; then kill -9 "$p" 2>/dev/null || true; fi; done' 2>/dev/null || true
     fi
 
     # 3. Clean stale data & orphaned state
@@ -261,6 +257,8 @@ run_matrix_stage() {
     -e "GENERATE_WORKLOADS=$GENERATE_WORKLOADS" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
+    -e "MAX_NUM_SEQS=$MAX_NUM_SEQS" \
+    -e "WORKLOAD_PATTERN=$MATRIX_WORKLOAD_PATTERN" \
     -e "INCLUDE_REAL_WORKLOAD=$INCLUDE_REAL_WORKLOAD" \
     -e "REAL_WORKLOAD=$REAL_WORKLOAD" \
     -e "REAL_WORKLOAD_LIMIT=$REAL_WORKLOAD_LIMIT" \
@@ -315,7 +313,7 @@ POLICIES=(
 )
 
 mapfile -d '' datasets < <(
-  find "$WORKLOAD_DIR" -type f -name '*.jsonl' -print0 | sort -z
+  find "$WORKLOAD_DIR" -type f -name "${WORKLOAD_PATTERN:-trace.jsonl}" -print0 | sort -z
 )
 if (( ${#datasets[@]} == 0 )); then
   echo "No JSONL workloads found recursively under $WORKLOAD_DIR." >&2
@@ -344,7 +342,9 @@ write_status() {
   printf '%s status=%s cache_mode=%s total=%s completed=%s skipped=%s active=%s failed=%s remaining=%s current=%s\n' \
     "$(date -Is)" "$status" "$CACHE_MODE" "$total_jobs" "$done_count" \
     "$skipped_count" "$active_count" "$failed_count" "$remaining_count" "$current" >"$tmp_status"
+  chmod 666 "$tmp_status" 2>/dev/null || true
   mv -f "$tmp_status" "$STATUS_FILE"
+  chmod 666 "$STATUS_FILE" 2>/dev/null || true
 }
 
 run_policy() {
@@ -358,6 +358,9 @@ run_policy() {
   local expected_rows actual_rows
 
   expected_rows=$(wc -l <"$dataset")
+  if [[ "$NUM_REQS" -gt 0 && "$expected_rows" -gt "$NUM_REQS" ]]; then
+    expected_rows="$NUM_REQS"
+  fi
 
   : >"$state_file"
   write_status RUNNING "$scenario/$policy"
@@ -365,8 +368,16 @@ run_policy() {
   if [[ -s "$output" ]]; then
     actual_rows=$(wc -l <"$output")
   fi
+
+  # Remove partial/incomplete outputs from interrupted runs
+  if [[ -s "$output" && "$actual_rows" -lt $((expected_rows + 1)) ]]; then
+    echo "=== CLEANUP partial output ($actual_rows/$((expected_rows + 1)) rows): $scenario / $policy ==="
+    rm -f "$output" "${output%.csv}_timeseries.csv" "${output}.routing.json" "${output}.sidecar.jsonl" "${output%.csv}_sidecar.jsonl"
+    actual_rows=0
+  fi
+
   if [[ "$SKIP_EXISTING" == "1" && "$actual_rows" -ge $((expected_rows + 1)) ]]; then
-    echo "=== SKIP $scenario / $policy ==="
+    echo "=== SKIP (complete) $scenario / $policy ==="
     mv -f "$state_file" "$STATE_DIR/$state_key.skipped"
     write_status RUNNING "$scenario/$policy"
     return 0
@@ -378,10 +389,15 @@ run_policy() {
   if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
     timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
   fi
+  local seq_args=()
+  if [[ -n "${MAX_NUM_SEQS:-}" && "${MAX_NUM_SEQS}" -gt 0 ]]; then
+    seq_args=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
+      "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
       --run-id "fairroute_${run_key}_${policy}_${BASHPID}" \
@@ -450,6 +466,7 @@ run_sweep_stage() {
     -e "NUM_REQS=$SWEEP_NUM_REQS" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
+    -e "MAX_NUM_SEQS=$MAX_NUM_SEQS" \
     -e "CACHE_MODE=$CACHE_MODE" \
     -e "STATUS_FILE=$SWEEP_STATUS_FILE" \
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
@@ -514,7 +531,9 @@ write_status() {
   printf '%s status=%s cache_mode=%s total=%s completed=%s skipped=%s active=%s failed=%s remaining=%s current=%s\n' \
     "$(date -Is)" "$status" "$CACHE_MODE" "$total_jobs" "$done_count" \
     "$skipped_count" "$active_count" "$failed_count" "$remaining_count" "$current" >"$tmp_status"
+  chmod 666 "$tmp_status" 2>/dev/null || true
   mv -f "$tmp_status" "$STATUS_FILE"
+  chmod 666 "$STATUS_FILE" 2>/dev/null || true
 }
 
 run_policy() {
@@ -529,10 +548,27 @@ run_policy() {
   : >"$state_file"
   write_status RUNNING "c${n_clients}/${scenario}/${policy}"
 
-  if [[ "$SKIP_EXISTING" == "1" && -s "$output" ]]; then
-    mv -f "$state_file" "$STATE_DIR/$state_key.skipped"
-    write_status RUNNING "c${n_clients}/${scenario}/${policy}"
-    return 0
+  local expected_rows="$NUM_REQS"
+  local actual_rows=0
+  if [[ -s "$output" ]]; then
+    actual_rows=$(wc -l <"$output")
+  fi
+
+  # Remove partial/incomplete outputs from interrupted runs
+  if [[ -s "$output" && "$expected_rows" -gt 0 && "$actual_rows" -lt $((expected_rows + 1)) ]]; then
+    echo "=== CLEANUP partial output ($actual_rows/$((expected_rows + 1)) rows): c${n_clients}/${scenario}/${policy} ==="
+    rm -f "$output" "${output%.csv}_timeseries.csv"
+    actual_rows=0
+  fi
+
+  if [[ "$SKIP_EXISTING" == "1" ]]; then
+    if [[ "$expected_rows" -gt 0 && "$actual_rows" -ge $((expected_rows + 1)) ]] || \
+       [[ "$expected_rows" -eq 0 && -s "$output" ]]; then
+      echo "=== SKIP (complete) c${n_clients}/${scenario}/${policy} ==="
+      mv -f "$state_file" "$STATE_DIR/$state_key.skipped"
+      write_status RUNNING "c${n_clients}/${scenario}/${policy}"
+      return 0
+    fi
   fi
 
   echo "=== RUN clients=$n_clients / scenario=$scenario / policy=$policy ==="
@@ -540,10 +576,15 @@ run_policy() {
   if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
     timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
   fi
+  local seq_args=()
+  if [[ -n "${MAX_NUM_SEQS:-}" && "${MAX_NUM_SEQS}" -gt 0 ]]; then
+    seq_args=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
+      "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
       --run-id "fairroute_sweep_c${n_clients}_${scenario}_${policy}_${BASHPID}" \

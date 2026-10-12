@@ -82,6 +82,7 @@ class Router:
         self._routed_scores = []
         self._routed_margins = []
         self._routing_stage_counts = {}
+        self._decision_records = []
         self._routing_policy_names = {
             "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_LINEAR",
             "FAIRROUTE_MULTIPLICATIVE", "FAIRROUTE_GATED",
@@ -183,15 +184,33 @@ class Router:
             gated = candidates
         best_latency = min(c["predicted_latency"] for c in gated)
         client_id = req_data.get("client_id", "default")
+        self._known_clients.add(client_id)
+
+        # --- Client-level fairness: service-based debt urgency ----------------
+        # Computes egalitarian debt relative to mean service across all known
+        # clients and maps it to an urgency in [0, 1) via exponential saturation.
+        target = fairness_target(self._total_service, len(self._known_clients))
+        service_debt = fairness_debt(
+            self.fairness_tracker.get_service(client_id), target
+        )
+        service_urgency = fairness_urgency(service_debt)
+
+        # --- Client-level fairness: delay-based urgency (optional) ------------
+        # When fairroute_n0 > 0, also compare client EWMA delay to the cluster
+        # median; a client experiencing disproportionate latency gets extra pull.
         delays = [
             value for owner, value in self._client_delay_ewma.items()
             if owner in self._known_clients
         ]
         median_delay = sorted(delays)[len(delays) // 2] if delays else 0.0
         client_delay = self._client_delay_ewma.get(client_id, 0.0)
-        urgency = 0.0
+        delay_urgency = 0.0
         if self.fairroute_n0 and median_delay > 0 and client_delay / median_delay > 1:
-            urgency = min(1.0, client_delay / median_delay - 1.0)
+            delay_urgency = min(1.0, client_delay / median_delay - 1.0)
+
+        # Combined: respond to whichever fairness dimension is most violated.
+        urgency = max(service_urgency, delay_urgency)
+
         epsilon = min(
             self._policy_params["fairroute_eps_max"],
             self._policy_params["fairroute_rho_slack"] * best_latency,
@@ -201,6 +220,13 @@ class Router:
             sum(self._replica_service.get(i, 0.0) for i in range(len(schedulers)))
             / max(1, len(schedulers))
         )
+
+        # Normalise queued work across the slack set to get per-candidate load
+        # headroom [0, 1].  Headroom 1 = least-loaded, 0 = most-loaded.
+        queued_works = [c["W"] for c in slack]
+        w_max, w_min = max(queued_works), min(queued_works)
+        w_span = max(w_max - w_min, 1.0)
+
         for candidate in slack:
             candidate["locality_key"] = (
                 candidate["hit"]
@@ -211,24 +237,66 @@ class Router:
             candidate["deficit"] = (
                 mean_service - candidate["service"]
             ) / max(mean_service, 1.0)
+            # Client-level fairness signal: steer underserved clients (high
+            # urgency) toward less-loaded replicas (high headroom).  This is
+            # candidate-varying, so it creates a genuine spread across replicas
+            # rather than a uniform offset that would cancel in argmin.
+            candidate["client_fairness"] = (
+                urgency * (w_max - candidate["W"]) / w_span
+            )
+
         selected = min(
             slack,
             key=lambda c: (
                 -c["locality_key"],
-                -c["deficit"],
+                -c["client_fairness"],  # client-level fairness (new)
+                -c["deficit"],          # replica-level fairness
                 c["predicted_latency"],
                 c["index"],
             ),
         )
-        result = self._finish_policy_choice(selected, -selected["predicted_latency"],
-                                             "fallback" if slo_risk else "slack",
-                                             candidates)
+
+        client_id = selected["client_id"]
+        key = (client_id, selected["index"])
+        selected["credit"] -= self._policy_params["credit_w_e"] * selected["n_ext"]
+        self._client_credit[key] = selected["credit"]
+        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
+            for k in list(self._client_credit):
+                if k[0] == client_id:
+                    self._client_credit[k] += self._credit_quantum(schedulers[k[1]])
+
+        gated_latencies = sorted(c["predicted_latency"] for c in gated)
+        margin = (gated_latencies[1] - gated_latencies[0]) if len(gated_latencies) > 1 else 0.0
+        stage = "fallback" if slo_risk else ("slack" if epsilon > 0 else "gate")
+        stage = f"{stage}:lexicographic"
+        self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+        credit_exhausted = self._client_credit.get(key, 0.0) <= 0
+        score = -selected["predicted_latency"]
+        if slo_risk:
+            score -= 0.001
+        self._routed_scores.append(score)
+        self._routed_margins.append(margin)
+
         self._replica_service[selected["index"]] = (
             self._replica_service.get(selected["index"], 0.0)
             + self._policy_params["credit_w_e"] * selected["n_ext"]
             + self._policy_params["credit_w_q"] * estimate
         )
-        return result
+
+        route_metrics = (
+            service_debt,
+            urgency,
+            selected["hit"],
+            selected["predicted_latency"],
+            selected["hit"],
+            margin,
+            len(gated),
+            len(slack),
+            stage,
+            int(credit_exhausted),
+            epsilon,
+        )
+        return selected["index"], score, route_metrics
 
     def _request_to_route_data(self, req):
         """Build the same candidate input for routed and handed-off requests."""
@@ -418,10 +486,13 @@ class Router:
         key = (client_id, selected["index"])
         selected["credit"] -= self._policy_params["credit_w_e"] * selected["n_ext"]
         self._client_credit[key] = selected["credit"]
+        self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+        self._routed_scores.append(score)
+        self._routed_margins.append(0.0)
         return selected["index"], score, (
             0.0, 0.0, selected["hit"], selected["predicted_latency"],
             selected["hit"], 0.0, len(candidates), len(candidates),
-            stage, int(selected["credit"] <= 0),
+            stage, int(selected["credit"] <= 0), 0.0,
         )
 
     @staticmethod
@@ -527,9 +598,9 @@ class Router:
         credit_exhausted = self._client_credit[(client_id, selected_index)] <= 0
         return selected_index, score, (
             debt, urgency, selected["locality"],
-            1.0 / max(selected["predicted_latency"], 1e-8),
+            selected["predicted_latency"],
             selected["hit"], margin, gate_size, slack_size, stage,
-            int(credit_exhausted),
+            int(credit_exhausted), epsilon,
         )
 
     def get_score_stats(self):
@@ -568,21 +639,49 @@ class Router:
                 "p95": percentile(0.95),
                 "p99": percentile(0.99),
             }
-        return {
+        diag = {
             "count": len(values),
             "decision_ns": percentiles,
             "stage_counts": dict(self._routing_stage_counts),
             "policy": self.routing_policy,
             "fairroute_n0": self.fairroute_n0,
         }
+        if self._decision_records:
+            n = len(self._decision_records)
+            diag["top1_agreement_rate"] = sum(1 for r in self._decision_records if r["top1_agreement"]) / n
+            diag["locality_sacrificed_rate"] = sum(1 for r in self._decision_records if r["locality_sacrificed"]) / n
+            diag["mean_gate_size"] = sum(r["gate_size"] for r in self._decision_records) / n
+            diag["mean_slack_size"] = sum(r["slack_size"] for r in self._decision_records) / n
+            diag["credit_exhaustion_rate"] = sum(1 for r in self._decision_records if r["credit_exhausted"]) / n
+            diag["mean_urgency"] = sum(r["urgency"] for r in self._decision_records) / n
+        return diag
 
     def save_diagnostics(self, output_file):
         """Write aggregate routing diagnostics beside a result CSV."""
         if not output_file:
             return
         target = output_file if os.path.isabs(output_file) else f"../{output_file}"
+        target_dir = os.path.dirname(target)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
         with open(f"{target}.routing.json", "w", encoding="utf-8") as handle:
             json.dump(self.get_decision_diagnostics(), handle, indent=2)
+
+    def save_decision_sidecar(self, output_file):
+        """Write per-request decision sidecar beside the output CSV."""
+        if not output_file or not self._decision_records:
+            return
+        target = output_file if os.path.isabs(output_file) else f"../{output_file}"
+        paths = [f"{target}.sidecar.jsonl"]
+        if target.endswith('.csv'):
+            paths.append(target[:-4] + '_sidecar.jsonl')
+        for path in set(paths):
+            out_dir = os.path.dirname(path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                for rec in self._decision_records:
+                    handle.write(json.dumps(rec) + "\n")
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -635,6 +734,8 @@ class Router:
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
             'client_id': row.get('client_id', 'default'),
+            'session_id': row.get('session_id', ''),
+            'sub_request_index': row.get('sub_request_index', 0),
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
@@ -691,16 +792,61 @@ class Router:
                 break
 
             started_ns = time.perf_counter_ns()
+            candidates, _ = self._candidate_set(self.prefill_schedulers, req_data)
+            slack_used = 0.0
+
             if self.routing_policy == "CUSTOM":
                 instance_id, route_score, route_metrics = self._custom_select(
                     self.prefill_schedulers, "prefill", req_data)
             elif self.routing_policy in self._routing_policy_names:
                 instance_id, route_score, route_metrics = self._select_instance(
                     self.prefill_schedulers, "prefill", req_data)
+                if len(route_metrics) > 10:
+                    slack_used = float(route_metrics[10])
+            elif self.routing_policy == "RR":
+                instance_id = self._rr_select(self.prefill_schedulers, "prefill")
+                stage = "round_robin"
+                self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+                selected = candidates[instance_id]
+                route_score = -selected["predicted_latency"]
+                self._routed_scores.append(route_score)
+                self._routed_margins.append(0.0)
+                route_metrics = (
+                    0.0, 0.0, selected["hit"], selected["predicted_latency"],
+                    selected["hit"], 0.0, len(candidates), len(candidates),
+                    stage, 0, 0.0
+                )
+            elif self.routing_policy == "RAND":
+                instance_id = self._rand_select(self.prefill_schedulers, "prefill")
+                stage = "random"
+                self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+                selected = candidates[instance_id]
+                route_score = -selected["predicted_latency"]
+                self._routed_scores.append(route_score)
+                self._routed_margins.append(0.0)
+                route_metrics = (
+                    0.0, 0.0, selected["hit"], selected["predicted_latency"],
+                    selected["hit"], 0.0, len(candidates), len(candidates),
+                    stage, 0, 0.0
+                )
+            elif self.routing_policy == "LOAD":
+                instance_id = self._least_load_select(self.prefill_schedulers, "prefill")
+                stage = "least_load"
+                self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+                selected = candidates[instance_id]
+                route_score = -selected["predicted_latency"]
+                self._routed_scores.append(route_score)
+                self._routed_margins.append(0.0)
+                route_metrics = (
+                    0.0, 0.0, selected["hit"], selected["predicted_latency"],
+                    selected["hit"], 0.0, len(candidates), len(candidates),
+                    stage, 0, 0.0
+                )
             else:
                 instance_id = self._select_instance(self.prefill_schedulers, "prefill")
                 route_score = 0.0
-                route_metrics = (0.0, 0.0, 0.0, 0.0, 0)
+                route_metrics = (0.0, 0.0, 0.0, 0.0, 0, 0.0, len(candidates), len(candidates), "default", 0, 0.0)
+
             decision_ns = time.perf_counter_ns() - started_ns
             self._decision_times_ns.append(decision_ns)
             sched = self.prefill_schedulers[instance_id]
@@ -738,6 +884,44 @@ class Router:
                 new_req.routing_slack_size = int(routing_details[1])
                 new_req.routing_stage = str(routing_details[2])
                 new_req.routing_credit_exhausted = bool(routing_details[3])
+
+            cand_lats = [c["predicted_latency"] for c in candidates]
+            cand_ttfts = [c.get("ttft", c["predicted_latency"]) for c in candidates]
+            cand_hits = [c["hit"] for c in candidates]
+            cand_loads = [c.get("W", c.get("requests", 0)) for c in candidates]
+            best_pred = min(range(len(candidates)), key=lambda i: cand_lats[i]) if cand_lats else 0
+            max_hit_idx = max(range(len(candidates)), key=lambda i: cand_hits[i]) if cand_hits else 0
+            max_hit_val = cand_hits[max_hit_idx] if cand_hits else 0
+            loc_sacrificed = bool(instance_id != max_hit_idx and max_hit_val > 0)
+            loc_tax = float(cand_lats[instance_id] - cand_lats[max_hit_idx]) if cand_lats else 0.0
+
+            decision_record = {
+                "request_id": int(new_req.id),
+                "client_id": new_req.client_id,
+                "arrival_time_ns": int(new_req.arrival),
+                "policy": self.routing_policy,
+                "chosen_replica": int(instance_id),
+                "decision_ns": int(decision_ns),
+                "stage": getattr(new_req, 'routing_stage', ''),
+                "gate_size": int(getattr(new_req, 'routing_gate_size', len(candidates))),
+                "slack_size": int(getattr(new_req, 'routing_slack_size', len(candidates))),
+                "total_candidates": len(candidates),
+                "urgency": float(getattr(new_req, 'routing_fairness_urgency', 0.0)),
+                "fairness_debt": float(getattr(new_req, 'routing_fairness_debt', 0.0)),
+                "slack_used": slack_used,
+                "credit_exhausted": bool(getattr(new_req, 'routing_credit_exhausted', False)),
+                "per_replica_predicted_latency": [float(x) for x in cand_lats],
+                "per_replica_predicted_ttft": [float(x) for x in cand_ttfts],
+                "per_replica_hit_tokens": [int(x) for x in cand_hits],
+                "per_replica_load": [float(x) for x in cand_loads],
+                "best_predicted_replica": int(best_pred),
+                "max_locality_replica": int(max_hit_idx),
+                "locality_sacrificed": loc_sacrificed,
+                "locality_tax_s": loc_tax,
+                "top1_agreement": bool(instance_id == best_pred),
+            }
+            self._decision_records.append(decision_record)
+
             self._request_clients[new_req.id] = new_req.client_id
             self._request_service[new_req.id] = new_req.output - new_req.input
             self._request_arrivals[new_req.id] = new_req.arrival

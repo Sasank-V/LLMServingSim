@@ -7,7 +7,7 @@ and the `examples/` folder ships ready-to-edit invocation templates.
 
 ## Layout
 
-```
+```text
 workloads/
 ├── *.jsonl                    workload files (flat or agentic; see Format)
 ├── generators/                JSONL generators
@@ -85,6 +85,7 @@ populated for prefix-cache hashing.
 
 
 ### SWE-bench agentic traces
+
 Agentic sessions derived from real SWE-bench coding tasks with LLM calls chained
 by tool calls (bash, grep, file edits). Each session is a complete coding task
 consisting of multiple LLM sub-requests (6--20 per session) interleaved with tool
@@ -101,6 +102,7 @@ and the format reference is
 [Workloads → JSONL format](https://llmservingsim.ai/docs/workloads/jsonl-format).
 
 ### Other
+
 | File | Description |
 | --- | --- |
 | `example_trace.jsonl` | Small example trace for quick testing |
@@ -153,7 +155,21 @@ fill `output_tok_ids` with the model's natural responses (free
 generation). Without it, `output_tok_ids` come straight from the
 ShareGPT assistant turn.
 
-Eight flags gate that mode:
+The source, length and arrival options are:
+
+| Group | Flags |
+| --- | --- |
+| Required | `--model`, `--num-reqs`, `--sps`, `--output` |
+| Source and sampling | `--source`, `--seed`, `--max-sessions` |
+| Length filters | `--min-input-toks`, `--max-input-toks`, `--min-output-toks`, `--max-output-toks`, `--max-kv-toks` |
+| Fixed random lengths | `--fix-len`, `--fix-input-length`, `--fix-output-length` |
+| Arrival patterns | `--first-arrival-sec`, `--pulse`, `--pulse-n`, `--pulse-delay-sec`, `--pulse-poisson` |
+
+`--fix-len` generates random token IDs at the requested lengths; it does not
+read or pad ShareGPT conversations and skips `--use-vllm`. The full reference
+linked below describes defaults and interactions.
+
+Free-generation options:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
