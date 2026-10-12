@@ -6,305 +6,210 @@ description: LLMServingSim release history
 All notable changes to this project are documented in this file.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) conventions.
 
-## [Unreleased]
+## [v1.2.0] - 2026-10-06
+
+Version 1.2.0 expands serving simulation, profiling and validation across dense,
+MoE and sparse/hybrid models. Major changes include reworked scheduling and
+tiered KV caching, TP/PP/DP/EP execution and communication corrections,
+model-aware attention/skew and deployment-aware MoE profiling, and
+speculative-decoding support.
+
+Trace reuse and streamlined ASTRA-Sim/Chakra integration reduce simulation
+overhead. Hardware profiling, RTX 4090 support, refreshed benchmark examples
+and documentation accompany the vLLM 0.28.0 compatibility upgrade
+([#76](https://github.com/casys-kaist/LLMServingSim/pull/76)).
+
+Accuracy claims apply to the recorded bundles and workloads on the
+[validation page](https://llmservingsim.ai/docs/validation), not every supported
+architecture or newly acquired profile.
+
+Existing checkouts must update the pinned submodules and rebuild ASTRA-Sim and
+Chakra; see the [update instructions](https://llmservingsim.ai/docs/contributor/pr-workflow#publishing-submodule-changes).
 
 ### Added
-- `docs/scripts/check-rendered.mjs` — scans the built site for source syntax that
-  survived into visible text (unparsed admonitions, bold, links, headings, table rows,
-  doubled list markers, visible HTML comments, JSX brace leaks), plus a structural
-  check on every mermaid diagram — unknown type, empty, unbalanced `subgraph`/`end` —
-  read from the source, since theme-mermaid leaves nothing in the static HTML. Runs as
-  a `postbuild` hook and as an explicit CI step, and exits non-zero.
-  `pnpm check-rendered`.
-- `serving/validate.sh` — 58 scenarios checked against recorded total clocks, plus md5
-  checks on each `bench/examples` entry's `outputs/sim.csv` and
-  `validation/summary.txt`, and a markdown report of anything that moved, ready to paste
-  into a PR. `--help` for options, `--clocks-only` to skip the slow stage, `--update` to
-  refresh `serving/validate-baselines.txt`. `serving/run.sh` is now one example per
-  feature; coverage lives in the new script.
-- `configs/cluster/single_node_dp_pp_instance.json` — dense `dp=2 x pp=2`, the DP+PP
-  shape with no MoE collective.
-- RTX 4090 profile bundle for `meta-llama/Llama-3.1-8B` (bf16, TP=1) with skew sweep,
-  plus `configs/cluster/rtx4090_{single,tp2,multi}_instance.json` — the `tp2` one is a
-  template, since only `tp1` is profiled for that card. Every TTFT / TPOT / latency
-  metric lands within 1% of a real vLLM run on the same card. Contributed by
-  [@Arifuzzamanjoy](https://github.com/Arifuzzamanjoy)
-  ([#59](https://github.com/casys-kaist/LLMServingSim/pull/59))
-- `bench/examples/` is keyed by `<hardware>/<model>` and each example carries its own
-  `config.json`, replacing the parallel `configs/` tree. `run.sh` / `validate.sh`
-  discover examples from the layout, so adding one needs no script edit
-- Per-tier KV cache block pools (`serving/core/block_pool.py`) and a tiered manager
-  (`serving/core/kv_cache_manager.py`), ported from vLLM v0.19.0. Each pool owns one
-  tier's free list, prefix index and refcounts. Both carry a Docker-free self-test
-- Chained block hashes (`hash(parent_hash, block_tokens)`) shared across tiers, as in
-  vLLM's `offloading/scheduler.py`: one walk yields both the NPU and lower-tier hit
-- `--npu-memory-utilization` (default `0.9`) with a per-instance `npu_mem.mem_util`
-  override. KV capacity is `npu_mem * utilization - weight`, mirroring vLLM's
-  `--gpu-memory-utilization`
-- `--reserve-full-isl` (on by default, per-instance `reserve_full_isl`): admit a request
-  only if its whole sequence fits, not merely its first chunk. Port of vLLM's
-  `scheduler_reserve_full_isl`
-- `python -m bench run` records vLLM's **resolved** configuration in `meta.json`:
-  `kv_cache` (`num_gpu_blocks` is the number a simulator must match), `hardware` and
-  `resolved_config`. All three are optional -- read them with `meta.get(...)`
-- A `KV Cache Initialization` block in the startup output, listing each instance's
-  derived block/token capacity and the utilization it came from
-- `Request.num_tokens_reached` (prompt + generated), mirroring vLLM's
-  `len(_all_token_ids)`. It cannot be derived from `num_computed_tokens`, which
-  preemption resets to 0
-- Public Docusaurus 3 docs site at [llmservingsim.ai](https://llmservingsim.ai), built
-  from `docs/` and deployed via GitHub Actions Pages. Long-form content moves off the
-  README, now a minimal front door; the split is documented in `AGENTS.md`
-- Local docs search via `@easyops-cn/docusaurus-search-local` (Ctrl/Cmd-K). The index is
-  built only in production -- use `pnpm build && pnpm serve` to test it
-- `full_cluster_kv_bytes_per_token()` in `memory_model.py`, computing full-cluster KV
-  bytes per token straight from an HF config. Avoids the per-rank roundoff in
-  `get_kv(1) * num_npus` and works before any `MemoryModel` exists
+
+- Architecture catalogs, tensor sizing and execution paths for DeepSeek-V3.2,
+  GLM-5, MiniMax-M3 and Qwen3.5/3.6/3.8 families, including sparse and hybrid
+  linear attention. See the [sparse](https://llmservingsim.ai/docs/examples/model-families/sparse-attention)
+  and [hybrid](https://llmservingsim.ai/docs/examples/model-families/hybrid-linear-attention) guides
+  for requirements and validation limits.
+- Modern-family profile bundles and a reduced DeepSeek-V3.2 diagnostic checkpoint
+  and benchmark; these do not establish full-scale DeepSeek accuracy.
+- Speculative decoding with configurable acceptance policies, multi-query
+  attention profiles and MTP drafter time and memory accounting.
+  [Usage and profile requirements](https://llmservingsim.ai/docs/examples/advanced/speculative-decoding).
+- Deployment-matched DP+EP MoE component profiles with explicit TP/DP geometry,
+  eager and CUDA graph measurements, resumable acquisition and coverage checks.
+  Missing deployment coverage warns and falls back to the legacy EP table;
+  invalid execution contracts and out-of-range component queries are rejected.
+  [Supported contracts](https://llmservingsim.ai/docs/profiler/native-moe-components).
+- Dynamic heterogeneous skew acquisition from token, request and KV bounds,
+  with per-forward timings, resumable progress and CPU-only `plan-skew` and
+  `refit-skew` commands.
+- Standalone `profiler hardware` acquisition and shared `hardware.yaml` defaults
+  for device specifications and measured NCCL links, with assumptions identified
+  separately. Explicit cluster settings take precedence.
+- Per-instance runtime overrides and capacity-normalized least-load routing,
+  plus per-dimension link settings with matching collective dimensions
+  ([#33](https://github.com/casys-kaist/LLMServingSim/pull/33),
+  [#37](https://github.com/casys-kaist/LLMServingSim/pull/37),
+  [#38](https://github.com/casys-kaist/LLMServingSim/pull/38)).
+- Run-isolated backend inputs through `--run-id` and `--inputs-root`, output-path
+  substitution and automatic cleanup of transient inputs; use `--save-trace-text`
+  or `--keep-inputs` to retain readable traces or backend replay artifacts
+  ([#43](https://github.com/casys-kaist/LLMServingSim/pull/43),
+  [#51](https://github.com/casys-kaist/LLMServingSim/pull/51)).
+- Optional per-operation analytical Ring links for AllReduce, AllGather and
+  ReduceScatter, measured by hardware profiling. Cluster overrides take precedence
+  over hardware defaults; unspecified operations retain the common link.
+  [Configuration](https://llmservingsim.ai/docs/reference/cluster-config#collective-specific-links).
+- Tiered KV block pools with chained prefix hashes, memory-utilization controls,
+  full-sequence admission checks and startup capacity reporting.
+- Optional MoE gate-statistics recording and `CUSTOM` routing from measured
+  distinct-expert curves. Diagnostic gate recordings are not latency references.
+- RTX 4090 Llama-3.1-8B TP1 profiles and a recorded benchmark example, contributed
+  by [@Arifuzzamanjoy](https://github.com/Arifuzzamanjoy)
+  ([#59](https://github.com/casys-kaist/LLMServingSim/pull/59)).
+  RTX 4090 TP2 configs remain templates until that degree is profiled.
+- Profiler coverage checks for missing or over-matched catalog bindings, and
+  `serving/validate.sh` regression checks against recorded clocks and examples.
+- Benchmark configuration-only checks, eager/dummy execution controls, explicit
+  KV capacity and tokenizer-free startup, plus opt-in step-shape and expert
+  diagnostics. Preemption and computed-versus-cached prompt work are recorded.
+- An opt-in resource watchdog for child processes, memory, swap, timeouts and
+  selected GPU telemetry; GPU selection through `VLLM_GPUS` in the vLLM launcher.
+- Public documentation with local search, model-family guides and rendered-site
+  checks. Release notes summarize final changes and link to detailed guides.
+- A [contributors page](https://github.com/casys-kaist/LLMServingSim/blob/main/CONTRIBUTORS.md)
+  crediting community code, documentation and issue analysis.
 
 ### Changed
-- The simulator is roughly **11x faster** with byte-identical results. The four
-  `bench/examples/` workloads go 16m 40s to 1m 26s in total (per-example 5.2x to 24.6x)
-  and the 19 `serving/run.sh` scenarios 18.95 min to 1.94 min, with every
-  `Total clocks (ns)` unchanged and all four `sim.csv` files byte-identical:
-  - The Chakra converter runs **in-process** instead of a subprocess per batch (~56 ms
-    each, ~52 ms of it interpreter startup), which had been 73-85% of wall-clock
-  - The converter takes the trace **as field tuples**, not text. The text file is now
-    written only for `--save-trace-text`
-  - **Converted graphs are reused** on an identical trace -- 4,405 of 8,810 batches are
-    dummies on the swe-bench MoE DP+EP example, only 22 of them distinct
-  - **ASTRA-Sim stops re-asking an idle NPU** until its answer could change: handshakes
-    drop from 337,786 to 2,462 on a 10-request 8-NPU run
-  - The analytical frontends no longer print a per-tick `Checking NPU ...` line, which
-    the frontend had to drain off the pipe (78-99.6% of lines read)
-  - Profile tables are built in plain Python and only for the TP degrees a run touches
-    (TP=1 startup 1435 ms to 50 ms); the architecture config is cached
-- **`--cleanup-inputs` is replaced by `--save-trace-text` and `--keep-inputs`**, both
-  defaulting off -- same observable default, no double negative. It was doing two jobs:
-  writing each batch's trace for inspection, and preserving the `.et` workloads and
-  generated configs for a manual ASTRA-Sim replay. `--no-cleanup-inputs` callers need
-  one of the two instead
-- Graph metadata stores the trace's **path**, not its text. Nothing consumed it and it
-  was 70% of every `.et`: 117,112 to 24,403 bytes per file on the swe-bench MoE DP+EP
-  example, ~720 MB to ~180 MB of I/O per run
-- All four canonical examples were regenerated on current `main`, since the previous
-  summaries predated the block pool rework, the pipeline-stage fix and the interpolation
-  change. TPOT means now land within 1.7% and latency means within 2.2%; TTFT means span
-  +1.3% to -13.6% (the MoE run, 30 ms absolute on the smallest values in the set). Docs
-  quoting "within 1.5%" or "-2.6% to -5.8%" are updated
-- **`npu_mem.mem_util` must be calibrated against the run you compare against.** The
-  simulator models neither vLLM's activation peak nor its CUDA context, so `0.9` buys
-  more KV cache here than in vLLM -- and KV capacity drives preemption. It only bites
-  when a run **saturates** the cache: read `kv_cache.num_gpu_blocks` from the bench
-  run's `meta.json` and pick the `mem_util` whose startup line reports the same count.
-  On the RTX 4090 example that is `0.833919`, worth -20.7% TTFT / +12.9% TPOT versus
-  +0.6% / +0.2%. The 96 GB RTXPRO6000 examples peak at 58-97% and are unaffected
-- The attention grid is interpolated **linearly**, not in log space (`_axis_bracket`).
-  Grid spacing decides where the kernel is sampled; the blend decides how samples
-  combine -- and the kernel is linear in each axis (decode attention fits
-  `time_us = a + b * (n_decode * kv_decode)` at R^2 = 1.0000). Leave-one-out over the
-  measured grid puts log space at +11.6-14.4% mean error against +2.3-3.7% for linear,
-  on all four axes across every bundle in `profiler/perf/`
-- With no skew profile the simulator applies **no** skew correction
-  (`_ATTN_SKEW_ALPHA_FALLBACK` 0.093 -> 0, i.e. `t_mean`) rather than a borrowed
-  constant; bundles with a real `skew_fit` are unaffected. The blend endpoints are far
-  apart (`t_max / t_mean` median ~1.5), so alpha has to be known to a couple of
-  hundredths to be worth applying. It is not bounded to `[0, 1]` either
-- `Scheduler` follows vLLM V1's `schedule()`: `self.running` first, preempting only from
-  its own tail, then `self.waiting` while budget and slots remain. Admission never
-  preempts and is skipped on any step that preempted. `schedule_base` and
-  `schedule_with_prefix` collapse into one `schedule()`; `scheduler.py` drops ~1300 to
-  ~510 lines, `memory_model.py` 885 to ~545
-- Preemption is vLLM verbatim, including `num_computed_tokens = 0`. That is not
-  re-prefill -- the blocks keep their hashes, so recovery comes from the tier hierarchy
-  rather than a "preserve the decode state" path
-- The three prefix-cache modes map onto three real vLLM configurations:
-  `--no-enable-prefix-caching` is prefix caching off, `--enable-prefix-caching` is
-  default vLLM, and `--prefix-storage CPU/CXL` is vLLM with LMCache or
-  `OffloadingConnector`. The previous middle case billed a transfer against an empty tier
-- `num_computed_tokens` advances when the batch is formed, as in vLLM's
-  `_update_after_schedule`, with `Batch.scheduled_tokens` as `add_done`'s snapshot.
-  Advancing at completion let `pp_size > 1` schedule the same tokens twice
-- Prefill and decode are no longer distinct scheduler states. A request catches up to
-  `num_tokens_reached`, and the trace classifies by scheduled token count (>1 = prefill
-  chunk, ==1 = decode) -- the only classification that survives a resumed request
-- A host offload tier uses 256-token chunks (LMCache's default) uniformly. Page size 1
-  matched at token granularity and over-reported hits against any real offload tier
-- `MemoryModel.get_weight` divides the transformer-block weight by `pp_size`
-  (heaviest-rank bound), adding a `pp_size` parameter to `__init__`. PP=1 unchanged
-- `MemoryModel.apply_kv_cache_events` also drains the second-tier queue for CXL prefix
-  storage and CPU + prefix-sharing, preventing unbounded growth. No accounting impact
-- Documentation: the PP write-up in `simulator/parallelism-mechanics.md` now describes
-  the Chakra layer split and inter-stage `COMM_SEND` / `COMM_RECV`, replacing a
-  "scheduling-only" framing; `--expert-routing-policy` is documented as defaulting to
-  `BALANCED` (not the non-existent `COPY`), with `--enable-block-copy` decoupled from
-  it; and `LOAD` scoring (`waiting * 4 + running`) is documented
 
-### Removed
-- `bench/bench-rtx4090.sh` -- a copy of `bench/bench.sh` differing only in defaults that
-  are already environment overrides there. Now an example in that script's header
-- `host_metadata.txt` and `scripts/capture-host-metadata.sh`. The script wrote three
-  `nvidia-smi` fields against ten hand-written ones in the file, and the information is
-  already in the profiler's `meta.yaml` and a bench run's `meta.json`
-- `bench/results/` and `outputs/rtx4090_llama/` artifacts committed past `.gitignore`.
-  Committed bench artifacts belong under `bench/examples/<hardware>/<model>/`
-- `serving/core/radix_tree.py` (675 lines), the SGLang-derived prefix-cache radix tree,
-  **replaced by `block_pool.py` + `kv_cache_manager.py`** (see Added). It served as both
-  index and allocator, and as an allocator it was inexact. Every user-visible
-  prefix-caching flag is unchanged; the SGLang attribution stays in `CONTRIBUTORS.md`
-- `--prioritize-prefill`, the per-instance `prioritize_prefill` key, and
-  `Scheduler._merge_by_arrival_id` (its only caller). vLLM v0.19.0 has no equivalent:
-  `SchedulerPolicy` is `fcfs` or `priority`, i.e. request priority
-- `Request.is_prefill()`, `evict`, `npu_last_node`, `cpu_last_node`,
-  `storage_last_node`, `_prefix_locked`; and from `MemoryModel`: `avail_size`,
-  `evictable_size`, `get_block_kv`, `get_evict_kv`, `lock_prefix`, `unlock_prefix`,
-  `cache_unfinished_req`, `cache_finished_req`, `evict_prefix_cache`, `prefix_match`,
-  `apply_kv_cache_events` and the two `_*_cache_hashtolen` maps
-- `Scheduler.get_first_arrival_time`, which read a never-assigned attribute and had no
-  callers (`Router.get_first_arrival_time` is the live one)
+- Upgrade profiling and benchmarking from vLLM 0.19.0 to 0.28.0, including V1/V2
+  runner and MoE-router integration. Benchmark recording defaults to NCCL-only
+  collectives and preserves effective engine, compilation and placement settings.
+- Measure ordinary and skew latency using per-call CUDA activity unions.
+  Initialize assigned KV pages with vLLM's deterministic dummy initializer outside
+  timing; CPU preparation and gaps are not added to simulated GPU work.
+- Derive profiling coverage and category-specific layer counts from the model and
+  resolved engine limits; the default attention KV reach follows model context.
+  Checkpoint ordinary sweeps and preserve unswept categories, TP/EP coverage,
+  query-length axes and authoritative main-engine geometry during partial refreshes.
+- Densify default token and sequence grids, including whole-block MoE, and use
+  configurable square-root-of-two attention axes. Skew density remains separately
+  configurable; denser acquisition increases profiling time.
+- Align `profile.sh` with CLI defaults and expose TP/DP and skew-only options.
+  `profile-all.sh` accepts per-model overrides and reports failed jobs without
+  abandoning the remaining campaign.
+- Share per-layer stack and catalog resolution between profiler and simulator,
+  using one catalog per model family rather than per checkpoint shape.
+  Account for MLA, sparse-indexer caches, linear-attention state and the heaviest
+  pipeline stage instead of assuming a uniform dense model.
+- Use linear attention-grid interpolation and query-weighted prefill coordinates.
+  Skew uses per-kernel, reference-aligned offline tables with bounded runtime
+  lookup; absent skew data applies no correction.
+  [Calibration and migration](https://llmservingsim.ai/docs/profiler/skew-alpha-fit).
+- Bound sparse-attention lookup by each kernel's checkpoint-defined key reach,
+  while indexer work still scales with the full history. Apply caps before
+  aggregating requests; the longest sequence is not always the slowest reference.
+- Key whole-block MoE profiles by EP degree, gathered token count and distinct
+  active experts. Select an exact EP table when available, otherwise warn and
+  use the nearest measured degree rather than interpolating across EP.
+- Align continuous batching, preemption and prefix-cache recovery with vLLM.
+  Hybrid prefix-cache chunks respect state-page boundaries; CUDA graph padding
+  and DP synchronization remain separate from real attention and head geometry.
+- Model asynchronous-scheduling admission lookahead, with per-instance control
+  and idle recovery, instead of admitting every arrival at batch completion.
+- Generalize the PIM latency estimate using head count, head dimension and GQA
+  ratio. This remains a baseline-scaled estimate, not independent measurements
+  for every architecture ([#45](https://github.com/casys-kaist/LLMServingSim/pull/45)).
+- Reduce simulation overhead with in-process Chakra conversion, reusable graphs,
+  lazy profile loading and fewer idle backend handshakes
+  ([#67](https://github.com/casys-kaist/LLMServingSim/pull/67)).
+- Organize benchmark examples by hardware/model with recorded configs and KV
+  block sizes. Refresh RTXPRO6000 Llama and NCCL-only Qwen references, native
+  Qwen3-30B component tables, hardware links and validation artifacts; keep the
+  RTX 4090 vLLM 0.19.0 reference identified separately.
 
 ### Fixed
-- **DP groups no longer hang with `tp > 1` or `pp > 1`**
-  ([#65](https://github.com/casys-kaist/LLMServingSim/issues/65)). A DP group only makes
-  progress if every NPU of every member runs the same round, and `add_done` enforces
-  that silently, so any path that creates or serves a batch the start NPU cannot claim
-  deadlocks with no error. Six defects broke it, each invisible at `tp=pp=1` where an
-  instance owns one NPU -- unregistered dummy batches, the solo workload path taken for
-  a shared folder, `pp_size` missing from the topology, a `len(inflight) == 0` dummy
-  gate, a servable batch with no `workload_name` yet, and `schedule()` refusing to let
-  the start NPU join. `ep_size` was irrelevant. The topology is now `[tp, pp, dp]`
-  innermost-first, matching vLLM, with `pp` dropped when it is 1. Reported by
-  [@hsule](https://github.com/hsule)
-- **Every admonition on the docs site rendered as raw text.** `:::caution Title` is
-  Docusaurus v2 syntax; v3 needs `:::caution[Title]`, and the bare form is not
-  recognised as a directive, so the block became a literal paragraph. 14 occurrences
-  across 13 pages, with no build warning. All bracketed, and
-  `docs/scripts/check-rendered.mjs` now fails the build on the whole class
-- `configs/cluster/rtx4090_tp2_instance.json` was documented as runnable in
-  `configs/cluster/README.md` ("not validated", i.e. runs without ground truth) and in
-  the examples table. It raises `FileNotFoundError`: only `tp1` is profiled for RTX4090.
-  Both now say it is a template until you profile the card with `TP_DEGREES=2`
-- **`dp > 1` with `pp > 1` still hung once the members stopped draining together**
-  ([#65](https://github.com/casys-kaist/LLMServingSim/issues/65), follow-up). Three
-  single-slot assumptions, each correct at `pp_size == 1` and wrong once an instance
-  holds `pp_size` batches: `schedule()` only let the start NPU join a formed batch when
-  the pipeline was **full**; `dp_ready_workloads` held one workload per instance, so an
-  NPU could run the wrong microbatch's graph; and `dp_pending[dg][inst]` held one batch,
-  silently dropping a member's first from the barrier. Both maps are now FIFOs, and the
-  join is tried before the depth cap. Needs members that drain at different times, which
-  `example_trace.jsonl` cannot reach, so the four `*_uneven` scenarios in
-  `serving/validate.sh` cover it. Reported by [@hsule](https://github.com/hsule)
-- Data parallelism over a **dense** model was rejected at startup with
-  `ep_size (1) not divisible by dp_group_size (2)`. `ep_size` is 1 there because a dense
-  model has no
-  experts to shard, so the EP divisibility checks now apply only to MoE.
-  `configs/cluster/single_node_dp_instance.json` is the repro
-- **`pp > 1` could complete the same request twice**
-  ([#62](https://github.com/casys-kaist/LLMServingSim/issues/62)). A request is
-  legitimately in more than one in-flight batch, and `add_done` ran the whole completion
-  path per batch: `KeyError` in `cache_blocks` with prefix caching on, a duplicated CSV
-  row with it off. `add_done` now skips requests already `FINISHED`, the same guard as
-  vLLM V1's `update_from_output`. Reported by [@hsule](https://github.com/hsule)
-- **Pipeline parallelism no longer deadlocks at most `pp_size` values**
-  ([#55](https://github.com/casys-kaist/LLMServingSim/issues/55)). The Chakra converter
-  split stages by *trace-line* count, so a boundary could land inside a transformer
-  block, where the sending layer's `output_size` and the receiving layer's `input_size`
-  are different tensors. ASTRA-Sim keys its send/recv tracker on `chunk_size`, so a
-  mismatch never resolves and the receiver waits forever with no error.
-  `trace_generator.py` now stamps `pp_stage_boundaries` into the trace header the way
-  vLLM's `get_pp_indices` partitions blocks, and the converter consumes them. Reported
-  by [@hu-op1](https://github.com/hu-op1), root cause narrowed down by
-  [@hsule](https://github.com/hsule)
-- `--enable-sub-batch-interleaving` is rejected with `pp_size > 1` instead of emitting a
-  wrong graph: an interleaved trace leaves both sub-batches mid-block at every group
-  edge. `pp_size` above `num_hidden_layers` is rejected too
-- The end-of-iteration `MEM_STORE` node was sized from the sampler's `input_size` -- the
-  full logits tensor -- billing a multi-megabyte write-back every iteration. vLLM V1
-  ships only token ids, which is the sampler's `output_size`. Affects every simulation
-- `--log-interval` above 1 second reported every windowed throughput as `0.0` and then
-  crashed the summary with `ZeroDivisionError`, from floor division in the scale factor
-- Chakra's `pyproject.toml` pinned `protobuf==6.*` while its checked-in `et_def_pb2.py`
-  needs the 7.35.1 runtime, so a fresh `scripts/compile.sh` downgraded protobuf and left
-  the converter raising `VersionError` on import. Hit any first-time setup
-- `scripts/docker-sim.sh` never installed `rich`, which both loggers import -- it came in
-  only transitively via `transformers`. `rich` is now declared, and the five packages
-  nothing in this container imports (`transformers`, `datasets`, `msgspec`,
-  `scikit-learn`, `xgboost`) are gone; `workloads/generators` asks for `transformers` by
-  name rather than surfacing a bare `ModuleNotFoundError`
-- **Model-architecture YAML docs match the code again**
-  ([#52](https://github.com/casys-kaist/LLMServingSim/issues/52)). The page documented
-  `cls:`, `category:`, `tp_collective:` and `ep_collective:`, none of which exist --
-  `LayerEntry` is `extra="forbid"`, so the example was rejected with 13 validation
-  errors. The real schema is `vllm:`, profile kind as the catalog block a layer sits in,
-  and `within:` / `tp_stable:`; `within:` was missing entirely. Class names for
-  `lm_head`, rotary embedding and the MoE block are corrected too, and the example is
-  now checked against the pydantic models
-- Doc/code alignment sweep: `_lookup_attention_with_skew` was described as always doing
-  "two 4D lookups" in five places when the second is conditional. Also fixed the
-  `Workload.cc` path and the PIM config paths
-- `outputs/*` (except the committed `outputs/example_*.csv`) and
-  `astra-sim/inputs/runs/` are now gitignored. `AGENTS.md` claimed they already were, so
-  scratch from every run accumulated in `git status`
-- Documentation corrections: the attention lookup was described as
-  "nearest-neighbour" when it has always bracketed and interpolated; the trace as
-  tab-separated when `_FMT` emits fixed-width space-padded columns; and the `SKIP_SKEW=1`
-  fallback alpha as "roughly 0.3", a figure no bundle reproduces
-- P/D disaggregation shipped 3x too much KV. `convert_prefill` sized the per-layer
-  SEND/RECV from the whole QKV activation, so it shipped Q as well (3x for
-  Llama-3.1-8B), and ignored `kv_cache_dtype`, making `--kv-cache-dtype fp8` 6x high.
-  The frontend now puts per-layer, per-rank K+V bytes in the trace's `comm_size` column
-- Preemption freed nothing. The loop guarded on `gen_req[-1].is_prefill()` over a list
-  built from non-prefill requests, so requests were marked evicted and the batch shrank
-  without a byte being released -- why a 24 GiB config could crash in `allocate`
-- `kv_cache_pct` was 0.0 in every bench `timeseries.csv`: `SchedulerStats` has no
-  `gpu_cache_usage` field (it is `kv_cache_usage`) and a `getattr` default hid the
-  mismatch. Read directly now, so a future rename fails loudly
-- Block hashes were unhashed at the prefix level, so two prefixes ending in the same 16
-  tokens collided (53 duplicates on a 300-request ShareGPT replay). Now chained through
-  the parent, as in vLLM
-- `TTFT` could be overwritten when a request resumed after preemption, because
-  `set_ttft` ran again on the recomputed prefill. Now recorded once, gated on `is_init`
-- `Scheduler` defined `schedule_with_prefix` twice; the first (228 lines) never ran
-- Chunked prefill double-counted prefix-cache hits, collapsing `total_len` to 1 for any
-  prefill chunk with a hit -- so dense-layer latency and TP collective sizing were looked
-  up at 1 token. `chunk_size` already excludes cached tokens; `Batch.hit_len` went with
-  the redundant subtraction
-- `_make_sub_batch` was not chunked-prefill aware: it used `req.is_init`, `req.input`
-  (the full prompt, not this step's chunk) and `prefill_k_list=0`, and leaked batch1
-  state into batch2. It now reads `batch.scheduled_tokens` and `req.num_computed_tokens`
-- `MemoryModel.evict_prefix_cache` over-evicted the second-tier cache by `num_npus`x,
-  sizing `space_needed` from per-rank bytes while a second-tier token is full-cluster.
-  Now uses the cache's own `kv_size`. TP=1 unaffected; TP>1 hit rates were collapsing
-- `MemoryModel.evict_prefix_cache`'s early-return guard required *both*
-  `not enable_prefix_caching` AND `bytes <= 0`; changed to `or`
-- NPU->CPU offload alloc/free in `scheduler.py` used per-rank bytes while prefix-cache
-  events tracked full-cluster ones, so `cpu_used` drifted at TP>1. Now scales by
-  `num_npus`
-- `MemoryModel.storage_cache_evicted_req` passed a **second-tier** node to
-  `npu_prefix_cache.inc_lock_ref()`; walking its parents never reaches the NPU tree's
-  root and dereferences `None`, crashing on eviction to CPU/CXL with prefix caching on
-  (PR #25)
-- `MemoryModel.avail_size` multiplied `RadixCache.avail_size()` -- already bytes -- by
-  `self._bytes_per_token`, making scheduler decisions under-conservative even at TP=1
-  (PR #25)
-- Hardcoded `131072` bytes-per-token (Llama-3.1-8B bf16) in five sites in
-  `serving/__main__.py` replaced with model-aware values, fixing the utilization readout
-  for the Qwen3 family and other models
-- Tuple-unpacking crash in the CXL + prefix-sharing display path:
-  `for i, cxl_id, cxl_pool in enumerate(prefix_pools)` raised `ValueError`
-- Refreshed validation baselines and website plots after the chunked-prefill +
-  prefix-cache fix. Means / P99s now slightly over-predict vLLM instead of
-  under-predicting, still within ~2.5% on TTFT / TPOT / latency means
+
+- Prevent pipeline deadlocks by splitting traces at transformer-block boundaries,
+  and prevent duplicate request completion with multiple in-flight batches
+  ([#55](https://github.com/casys-kaist/LLMServingSim/issues/55),
+  [#62](https://github.com/casys-kaist/LLMServingSim/issues/62)).
+  Reported by [@hu-op1](https://github.com/hu-op1) and
+  [@hsule](https://github.com/hsule). Reject PP stages exceeding the layer count
+  and unsupported PP with sub-batching; regenerate old PP traces with stage boundaries.
+- Fix dense DP validation and DP+TP/PP synchronization when members drain
+  unevenly, and isolate collectives between independent non-DP instances.
+  Snapshot speculative state per batch to prevent rollback deadlocks.
+  DP synchronization reports: [@hsule](https://github.com/hsule),
+  [#65](https://github.com/casys-kaist/LLMServingSim/issues/65).
+- Correct prefix-hit accounting, preemption, cross-tier allocation/eviction and
+  sub-batch geometry. Preserve TTFT across recomputation and correct P/D handoff
+  accounting; transfer per-rank K+V bytes rather than the full QKV activation.
+  Cache fixes include contributions from @horser1, @shermanjlim and @Veilwalker
+  ([#49](https://github.com/casys-kaist/LLMServingSim/pull/49)).
+- Include TP embedding reduction and logits gathering with correct vocabulary
+  padding and tensor sizes. Idle DP forwards omit the head; terminal host stores
+  contain output token IDs rather than logits.
+- Preserve ordered MoE tensor collectives and dependencies through Chakra and
+  dimension-scoped backend numbering. Correct global EP-rank lookup,
+  round-robin token assignment, group-limited distinct-expert routing and
+  small-batch rounding that could incorrectly charge zero expert work.
+- Fit collective links using ASTRA-Sim's Ring phases, rank count, GiB/s units
+  and separate local reduction costs; record fit residuals and assumptions.
+  Primitive calibration does not model exact grouped NCCL execution.
+- Correct vLLM 0.28 timing normalization, top-level deduplication and CUDA
+  ownership, including whole-block MoE invocation counts. Capture the V2
+  sampler through the layerwise profiler without adding GPU computation.
+- Measure Qwen3 query/key normalization per TP degree instead of copying TP1
+  timings, and shard linear-attention state consistently during TP emulation.
+  Preserve resolved KV block sizes separately for each TP degree.
+- Retain native top-k work in forced-routing MoE profiles and avoid
+  double-counting sparse-indexer kernels. Re-profile older forced-routing or
+  hybrid MoE tables and affected sparse-indexer glue rows.
+- Preserve profiled decode request boundaries, fractional resume coordinates,
+  multi-query feasibility and skew batch identity. Reject incompatible or
+  corrupt acquisitions instead of silently resuming them.
+- Correct per-kernel attention/skew lookup, regime-dependent linear attention,
+  MTP attribution, quantization/variant resolution and architecture-specific
+  tensor sizes. Disabling block-copy optimization now retains every layer.
+- Restore MiniMax-M3 MTP startup and SM120 sparse-MLA prefill through targeted
+  vLLM patches; correct container dependencies and Chakra protobuf compatibility.
+- Repair the first-node dependency in PIM graphs, absolute cluster-config paths
+  and runtime argument shadowing.
+- Anchor benchmark TTFT and end-to-end latency at request arrival using an
+  estimated epoch-to-monotonic clock offset; retain the queued-time fallback
+  when conversion is unavailable. TPOT still uses token timestamps.
+- Correct benchmark KV utilization and throughput reporting, preserve engine
+  metadata before shutdown, and reject incomplete or perturbed validation inputs.
+- Correct architecture-schema examples
+  ([#52](https://github.com/casys-kaist/LLMServingSim/issues/52)), README layouts,
+  setup instructions and documentation rendering. Complete CLI indexes and
+  align option defaults and subcommand scope. Align MTP costs, shipped
+  sparse profiles, accelerator-acquisition scope and metric definitions with
+  current code; keep public guides focused on supported behavior and limits.
+
+### Removed
+
+- Legacy skew fitting and lookup on the enabled simulator path; use
+  `profiler refit-skew` for compatible raw data. Incompatible acquisition
+  protocols require remeasurement, not a CSV format conversion.
+- Simulator `--dtype` / `--kv-cache-dtype` flags; dtypes now come from the model
+  config. Profiler and benchmark
+  precision options remain available.
+- `--prioritize-prefill` and its instance override; requests follow the unified
+  continuous-batching scheduler.
+- The catalog `sequence:` format; use `blocks:` and `shared:`. Replace custom
+  imports of the old radix-tree cache with the tiered block-pool APIs.
 
 ### Security
-- Bump `fast-uri` to ≥3.1.2 (CVE-2026-6321 path traversal, CVE-2026-6322 host confusion,
-  both High). Pinned in `pnpm.overrides` as a transitive Docusaurus dependency
-- Bump `@babel/plugin-transform-modules-systemjs` to ≥7.29.4 (GHSA-fv7c-fp4j-7gwp,
-  CVE-2026-44728, High): arbitrary code generation on malicious input in 7.12.0-7.29.3.
-  We shipped 7.29.0 via `@docusaurus/preset-classic`. Pinned in `pnpm.overrides`
-- Bump `serialize-javascript` to ≥7.0.5 (XSS via deferred function / regexp
-  serialization), pulled in by webpack plugins in Docusaurus 3.10
-- Bump `uuid` to ≥14.0.0 (missing buffer bounds check in v3/v5/v6 when `buf` is given),
-  replacing both the transitive 8.3.2 via `sockjs` and 11.1.1
+
+- Update documentation dependencies: `fast-uri` to at least 3.1.2
+  (CVE-2026-6321 / CVE-2026-6322), `@babel/plugin-transform-modules-systemjs`
+  to at least 7.29.4 (CVE-2026-44728), `serialize-javascript` to at least 7.0.5
+  and `uuid` to at least 14.0.0 for their security fixes.
 
 ## [v1.1.0] - 2026-04-26
 
