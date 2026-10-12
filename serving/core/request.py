@@ -70,6 +70,7 @@ class Request:
 
         # How many times this request has been preempted.
         self.num_preemptions = 0
+        self.recompute_tokens = 0
         # Prefix-cache stats are recorded once per request per tier.
         self._prefix_npu_stats_counted = False
         self._prefix_storage_stats_counted = False

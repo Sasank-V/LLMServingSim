@@ -487,7 +487,10 @@ def main():
                             'PRISM', 'D2LPM',
                             'CUSTOM',
                         ],
-                        default='LOAD')
+                        default='LOAD',
+                        help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
+                        'RR (round-robin), RAND (random), or one of the FairRoute/PRISM/D2LPM combination forms '
+                        '(CUSTOM is user-defined)')
     parser.add_argument('--num-speculative-tokens', type=int, default=0,
                         dest='num_speculative_tokens',
                         help='speculative decoding draft length N (vLLM\'s num_speculative_tokens). '
@@ -507,10 +510,6 @@ def main():
                         help='how the accepted count is drawn: FIXED (default, every draft '
                         'position at the pooled rate), DECAY (per-position rates, which fall with '
                         'draft position -- same mean, different spread), CUSTOM (user-defined)')
-    parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'CUSTOM'], default='LOAD',
-                        help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
-                        'RR (round-robin), RAND (random), or one of the explicit FairRoute combination forms '
-                        '(CUSTOM is user-defined)')
     parser.add_argument('--fairroute-n0', type=float, default=0.0,
                         help='EWMA prior weight for FairRoute client estimates (0 preserves current behavior).')
     parser.add_argument('--expert-routing-policy', type=str,
@@ -1570,6 +1569,7 @@ def main():
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
         router.save_diagnostics(output_file)
+        router.save_decision_sidecar(output_file)
 
     # --save-trace-text writes the text into the run directory, so keeping it
     # is implied: producing the text and then deleting it would be pointless.

@@ -369,7 +369,9 @@ class Scheduler:
             if req.num_preemptions > 0:
                 # Resuming. Whatever neither tier could return has to be
                 # computed again; with no lower tier that is the whole sequence.
-                self.recompute_tokens += max(0, req.num_tokens_reached - num_computed)
+                recomputed = max(0, req.num_tokens_reached - num_computed)
+                self.recompute_tokens += recomputed
+                req.recompute_tokens = getattr(req, 'recompute_tokens', 0) + recomputed
                 self.logger.info("Resuming request #%d (%d of %d tokens recovered)",
                                  req.id, num_computed, req.num_tokens_reached)
             req.num_computed_tokens = num_computed
@@ -869,7 +871,7 @@ class Scheduler:
                     getattr(req, 'prefix_cache_hit', 0),
                     getattr(req, 'npu_cache_hit', 0),
                     getattr(req, 'storage_cache_hit', 0),
-                    max(0, req.original_input - getattr(req, 'prefix_cache_hit', 0)),
+                    getattr(req, 'recompute_tokens', 0),
                     getattr(req, 'num_preemptions', 0),
                     getattr(req, 'session_id', ''),
                     getattr(req, 'sub_request_index', ''),

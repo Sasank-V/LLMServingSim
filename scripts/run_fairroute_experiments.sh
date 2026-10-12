@@ -45,16 +45,18 @@ CONTAINER="${CONTAINER:-servingsim_docker}"
 DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
-SKIP_EXISTING="${SKIP_EXISTING:-1}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-6}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 # Per-simulation wall-clock timeout in seconds (0 = no timeout).
 # Protects the run from a single hung simulation stalling the entire matrix.
 SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
 MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute}"
+MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
 MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute}"
-MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-1000}"
+MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"
 MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
 MATRIX_SEED="${MATRIX_SEED:-42}"
 MATRIX_WORKLOAD_SCENARIOS="${MATRIX_WORKLOAD_SCENARIOS:-c0_calibration,balanced_control,locality_conflict,fairness_conflict,prediction_burst,full_adversarial,u5_vtc_as_published,w2_heavy_light,w4_flooding,u2_multiturn,u3_loogle_proxy}"
@@ -255,6 +257,8 @@ run_matrix_stage() {
     -e "GENERATE_WORKLOADS=$GENERATE_WORKLOADS" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
+    -e "MAX_NUM_SEQS=$MAX_NUM_SEQS" \
+    -e "WORKLOAD_PATTERN=$MATRIX_WORKLOAD_PATTERN" \
     -e "INCLUDE_REAL_WORKLOAD=$INCLUDE_REAL_WORKLOAD" \
     -e "REAL_WORKLOAD=$REAL_WORKLOAD" \
     -e "REAL_WORKLOAD_LIMIT=$REAL_WORKLOAD_LIMIT" \
@@ -309,7 +313,7 @@ POLICIES=(
 )
 
 mapfile -d '' datasets < <(
-  find "$WORKLOAD_DIR" -type f -name '*.jsonl' -print0 | sort -z
+  find "$WORKLOAD_DIR" -type f -name "${WORKLOAD_PATTERN:-trace.jsonl}" -print0 | sort -z
 )
 if (( ${#datasets[@]} == 0 )); then
   echo "No JSONL workloads found recursively under $WORKLOAD_DIR." >&2
@@ -368,7 +372,7 @@ run_policy() {
   # Remove partial/incomplete outputs from interrupted runs
   if [[ -s "$output" && "$actual_rows" -lt $((expected_rows + 1)) ]]; then
     echo "=== CLEANUP partial output ($actual_rows/$((expected_rows + 1)) rows): $scenario / $policy ==="
-    rm -f "$output" "${output%.csv}_timeseries.csv"
+    rm -f "$output" "${output%.csv}_timeseries.csv" "${output}.routing.json" "${output}.sidecar.jsonl" "${output%.csv}_sidecar.jsonl"
     actual_rows=0
   fi
 
@@ -385,10 +389,15 @@ run_policy() {
   if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
     timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
   fi
+  local seq_args=()
+  if [[ -n "${MAX_NUM_SEQS:-}" && "${MAX_NUM_SEQS}" -gt 0 ]]; then
+    seq_args=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
+      "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
       --run-id "fairroute_${run_key}_${policy}_${BASHPID}" \
@@ -457,6 +466,7 @@ run_sweep_stage() {
     -e "NUM_REQS=$SWEEP_NUM_REQS" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
+    -e "MAX_NUM_SEQS=$MAX_NUM_SEQS" \
     -e "CACHE_MODE=$CACHE_MODE" \
     -e "STATUS_FILE=$SWEEP_STATUS_FILE" \
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
@@ -566,10 +576,15 @@ run_policy() {
   if [[ "${SIM_TIMEOUT:-0}" -gt 0 ]]; then
     timeout_prefix=(timeout --kill-after=10s "$SIM_TIMEOUT")
   fi
+  local seq_args=()
+  if [[ -n "${MAX_NUM_SEQS:-}" && "${MAX_NUM_SEQS}" -gt 0 ]]; then
+    seq_args=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --dtype bfloat16 --block-size 16 \
+      "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
       --run-id "fairroute_sweep_c${n_clients}_${scenario}_${policy}_${BASHPID}" \
