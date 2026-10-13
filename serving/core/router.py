@@ -20,7 +20,9 @@ from .algorithms.fairroute import (
 )
 from .algorithms.locality import locality_score
 from .algorithms.prediction import predict_queue, replica_is_safe
-from .algorithms.utils import kv_utilization, reactive_load
+from .algorithms.utils import kv_utilization, reactive_load, tiebreak_jitter
+from .algorithms.published import D2LPMRouter
+from .kv_cache_manager import request_block_hashes
 from .logger import get_logger
 
 
@@ -59,11 +61,11 @@ class Router:
         self._client_credit_refill = {}
         self._replica_service = {}
         self._known_clients = set()
-        self._total_service = 0.0
         self.custom_routing_fn = custom_routing_fn
         self.fairroute_n0 = max(0.0, float(fairroute_n0))
         self._global_output_ewma = 1.0
         self._global_delay_ewma = 0.0
+        self._d2lpm = D2LPMRouter(num_instances)
         self._global_output_samples = []
         self._policy_params = {
             "prism_p": 4.0,
@@ -189,7 +191,7 @@ class Router:
         # --- Client-level fairness: service-based debt urgency ----------------
         # Computes egalitarian debt relative to mean service across all known
         # clients and maps it to an urgency in [0, 1) via exponential saturation.
-        target = fairness_target(self._total_service, len(self._known_clients))
+        target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
         service_debt = fairness_debt(
             self.fairness_tracker.get_service(client_id), target
         )
@@ -245,14 +247,15 @@ class Router:
                 urgency * (w_max - candidate["W"]) / w_span
             )
 
+        _req_idx = req_data.get("index", 0)
         selected = min(
             slack,
             key=lambda c: (
                 -c["locality_key"],
-                -c["client_fairness"],  # client-level fairness (new)
+                -c["client_fairness"],  # client-level fairness
                 -c["deficit"],          # replica-level fairness
                 c["predicted_latency"],
-                c["index"],
+                tiebreak_jitter(_req_idx, c["index"]),  # uniform tie-break
             ),
         )
 
@@ -465,16 +468,19 @@ class Router:
 
     def _select_d2lpm(self, schedulers, req_data):
         candidates, _ = self._candidate_set(schedulers, req_data)
-        matched = [c for c in candidates if c["hit"] >= self._policy_params["h_min"]]
-        max_hit = max((c["hit"] for c in candidates), default=0)
-        group = [c for c in matched if c["hit"] == max_hit] if max_hit >= self._policy_params["h_min"] else candidates
-        active = [c for c in candidates if c["credit"] > 0]
-        eligible = [c for c in group if c["credit"] > 0]
-        pool = eligible or active
-        if not pool:
-            self._refill_credits(req_data.get("client_id", "default"), schedulers)
-            pool = candidates
-        selected = min(pool, key=lambda c: (c["requests"], c["index"]))
+        block_size = schedulers[0].kv.block_size
+        hashes = []
+        token_ids = req_data.get("input_hash_ids", [])
+        if token_ids:
+            probe = type("PrefixProbe", (), {})()
+            probe.input_hash_ids, probe.output_hash_ids, probe.block_hashes = token_ids, [], None
+            hashes = request_block_hashes(probe, block_size)
+        client = req_data.get("client_id") or "default"
+        queues = [len(s.waiting) for s in schedulers]
+        selected_idx = self._d2lpm.route(
+            client, hashes, req_data["input_toks"], block_size, queues)
+        self._d2lpm.inflight[req_data["index"]] = (client, selected_idx)
+        selected = candidates[selected_idx]
         return self._finish_policy_choice(selected, -selected["requests"], "d2lpm", candidates)
 
     def _refill_credits(self, client_id, schedulers):
@@ -495,24 +501,13 @@ class Router:
             stage, int(selected["credit"] <= 0), 0.0,
         )
 
-    @staticmethod
-    def _tiebreak_jitter(request_index, candidate_index):
-        """Deterministic hash-based jitter to break ties without systematic bias.
-
-        Using -candidate["index"] as tie-break always selects the lowest index,
-        causing pathological hotspotting when scores are equal. This hashes the
-        (request, candidate) pair to produce a stable but uniformly scattered
-        value, so ties distribute evenly across replicas.
-        """
-        h = hashlib.md5(f"{request_index}:{candidate_index}".encode()).digest()
-        return int.from_bytes(h[:4], 'little') / 0xFFFFFFFF
 
     def _select_fairroute_candidate(self, schedulers, req_data):
         """Route with FairRoute's gate -> slack -> lexicographic pipeline."""
         client_id = req_data.get("client_id", "default")
         request_index = req_data.get("index", 0)
         self._known_clients.add(client_id)
-        target = fairness_target(self._total_service, len(self._known_clients))
+        target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
         debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
         urgency = fairness_urgency(debt)
         client_output = self._client_output_ewma.get(client_id, self._global_output_ewma)
@@ -572,7 +567,8 @@ class Router:
             "D2LPM": "LEARNED",
         }
         selected, epsilon = choose_fairroute_candidate(
-            feasible, mode=mode_by_policy[self.routing_policy], urgency=urgency)
+            feasible, mode=mode_by_policy[self.routing_policy], urgency=urgency,
+            request_index=req_data.get("index", 0))
         slack_size = len(feasible)
         stage = "fallback" if slo_risk else "gate"
         if epsilon > 0:
@@ -949,7 +945,7 @@ class Router:
     # Agentic dependency chain management
     # -----------------------------------------------------------------------
 
-    def notify_request_completed(self, request_id, completion_time_ns):
+    def notify_request_completed(self, request_id, completion_time_ns, req=None):
         """Called when a request finishes. Releases the next sub-request in
         the session chain after the tool_call duration elapses.
 
@@ -960,11 +956,13 @@ class Router:
         service = self._request_service.pop(request_id, 0)
         arrival = self._request_arrivals.pop(request_id, completion_time_ns)
         instance_id = self._request_instances.pop(request_id, None)
+        if self.routing_policy == "D2LPM" and request_id in self._d2lpm.inflight:
+            generated = max(0, (req.output - req.original_input)) if req is not None else service
+            self._d2lpm.on_finish(request_id, generated)
         expected_output = self._request_output_estimates.pop(
             request_id, self._global_output_ewma
         )
         self.fairness_tracker.record_service(client_id, service)
-        self._total_service += service
         previous_output = self._client_output_ewma.get(client_id, float(service))
         self._client_output_ewma[client_id] = 0.1 * float(service) + 0.9 * previous_output
         self._global_output_samples.append(float(service))
@@ -982,14 +980,23 @@ class Router:
                     self._policy_params["credit_w_q"] * service
                 )
             elif self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
-                self._replica_service[instance_id] = (
-                    self._replica_service.get(instance_id, 0.0)
-                    + self._policy_params["credit_w_q"] * (service - expected_output)
+                # Correct replica_service for output-length prediction error.
+                # The correction is bounded to [-service, +service] so a
+                # persistent estimator bias does not compound without limit;
+                # the running total is floored at 0 so it never goes negative.
+                raw_correction = self._policy_params["credit_w_q"] * (service - expected_output)
+                bounded_correction = max(-float(service), min(float(service), raw_correction))
+                self._replica_service[instance_id] = max(
+                    0.0,
+                    self._replica_service.get(instance_id, 0.0) + bounded_correction,
                 )
         if instance_id is not None:
             if self.routing_policy not in {"FAIRROUTE", "FAIRROUTE_V2"}:
                 self._replica_service[instance_id] = self._replica_service.get(instance_id, 0.0) + service
-        self.fairness_tracker.record_latency(client_id, float(completion_time_ns - arrival))
+        latency = getattr(req, "latency", -1) if req is not None else -1
+        if latency < 0:
+            latency = completion_time_ns - arrival
+        self.fairness_tracker.record_latency(client_id, float(latency))
         if session_info is None:
             return
         session_id, completed_idx = session_info

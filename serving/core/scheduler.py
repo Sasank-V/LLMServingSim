@@ -12,6 +12,7 @@ from .memory_model import *
 from .graph_generator import *
 from .trace_generator import *
 from .logger import print_markup, print_rule
+from .algorithms.published import VTC, DLPM
 from .pim_model import *
 import numpy as np
 
@@ -38,7 +39,8 @@ class Scheduler:
                  enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
                  npu_memory_utilization=1.0, reserve_full_isl=True,
-                 acceptance_model=None, async_scheduling=True):
+                 acceptance_model=None, async_scheduling=True,
+                 local_scheduling_policy="FCFS"):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -97,6 +99,11 @@ class Scheduler:
         # draft tokens the target accepts is the one thing a simulator cannot
         # compute, so it is a policy with a per-model published default.
         self.spec = acceptance_model
+        self.local_scheduling_policy = local_scheduling_policy.upper()
+        if self.local_scheduling_policy not in {"FCFS", "VTC", "DLPM"}:
+            raise ValueError(f"Unsupported local scheduling policy: {local_scheduling_policy}")
+        self.local_policy = VTC() if self.local_scheduling_policy == "VTC" else (
+            DLPM() if self.local_scheduling_policy == "DLPM" else None)
 
         # Requests admitted and still generating. Persistent across steps: this
         # is what gives the scheduler a notion of "already running", which the
@@ -319,7 +326,29 @@ class Scheduler:
         while self.waiting and token_budget > 0:
             if len(self.running) >= self.max_num_seqs:
                 break
-            req = self.waiting[0]
+            arrived = [r for r in self.waiting if r.arrival <= cutoff]
+            if self.local_scheduling_policy == "VTC":
+                req = self.local_policy.pick(arrived)
+            elif self.local_scheduling_policy == "DLPM":
+                if not arrived:
+                    break
+                self.local_policy.refill_for(arrived)
+                req = self.local_policy.order(arrived, self._local_hit_tokens)[0]
+                # A client without deficit cannot consume a slot; try another
+                # eligible client in prefix order.
+                eligible = [r for r in self.local_policy.order(arrived, self._local_hit_tokens)
+                            if self.local_policy.deficits[r.client_id or "default"] > 0]
+                if not eligible:
+                    self.local_policy.refill_for(arrived)
+                    eligible = [r for r in self.local_policy.order(arrived, self._local_hit_tokens)
+                                if self.local_policy.deficits[r.client_id or "default"] > 0]
+                if not eligible:
+                    break
+                req = eligible[0]
+            else:
+                req = self.waiting[0]
+            if req is None:
+                break
             if req.arrival > cutoff:
                 # Arrival-sorted, so nothing behind it has arrived either.
                 break
@@ -365,7 +394,11 @@ class Scheduler:
                 # vLLM breaks here: a waiting request never causes a preemption.
                 break
 
-            self.waiting.pop(0)
+            self.waiting.remove(req)
+            if self.local_scheduling_policy == "VTC":
+                self.local_policy.on_admit(req, self.waiting)
+            elif self.local_scheduling_policy == "DLPM":
+                self.local_policy.on_admit(req, num_npu_hit)
             if req.num_preemptions > 0:
                 # Resuming. Whatever neither tier could return has to be
                 # computed again; with no lower tier that is the whole sequence.
@@ -703,6 +736,8 @@ class Scheduler:
                 # output and must not be counted as throughput.
                 committed = min(1 + accepted,
                                 max(req.output - req.num_tokens_reached, 0))
+                if self.local_policy is not None:
+                    self.local_policy.on_output_tokens(req, committed)
                 req.num_tokens_reached += committed
                 gen_t += committed
                 if not prefill_done_now:
@@ -744,11 +779,21 @@ class Scheduler:
 
     def add_request(self, req, is_init=True):
         new_req = Request(*(req), is_init=is_init)
+        if self.local_scheduling_policy == "VTC":
+            self.local_policy.on_arrival(new_req, self.waiting)
+        elif self.local_scheduling_policy == "DLPM":
+            self.local_policy.on_arrival(new_req)
         # Arrival order, which phase B relies on to stop at the first request
         # that has not arrived yet. Dynamically released agentic sub-requests
         # arrive mid-run, hence insort rather than append.
         bisect.insort(self.waiting, new_req, key=lambda r: (r.arrival, r.id))
         return new_req
+
+    def _local_hit_tokens(self, req):
+        if not self.enable_prefix_caching or req.num_computed_tokens:
+            return int(getattr(req, "prefix_cache_hit", 0))
+        _, npu, _lower = self.kv.get_computed_blocks(req)
+        return npu
 
     def add_decode(self, req):
         """Take over a request whose prefill ran on another instance.
@@ -837,7 +882,7 @@ class Scheduler:
                     'routing slack size', 'routing credit exhausted',
                     'prefix_cache_hit', 'npu_cache_hit', 'storage_cache_hit',
                     'recompute_tokens', 'num_preemptions',
-                    'session_id', 'sub_request_index'
+                    'session_id', 'sub_request_index', 'local scheduling policy'
                 ])
             
             # Write each request's information
@@ -875,6 +920,7 @@ class Scheduler:
                     getattr(req, 'num_preemptions', 0),
                     getattr(req, 'session_id', ''),
                     getattr(req, 'sub_request_index', ''),
+                    self.local_scheduling_policy,
                 ])
 
 

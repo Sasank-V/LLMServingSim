@@ -491,6 +491,9 @@ def main():
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), or one of the FairRoute/PRISM/D2LPM combination forms '
                         '(CUSTOM is user-defined)')
+    parser.add_argument('--local-scheduling-policy', type=str,
+                        choices=['FCFS', 'VTC', 'DLPM'], default='FCFS',
+                        help='within-instance waiting-queue policy: FCFS, VTC, or prefix-aware DLPM')
     parser.add_argument('--num-speculative-tokens', type=int, default=0,
                         dest='num_speculative_tokens',
                         help='speculative decoding draft length N (vLLM\'s num_speculative_tokens). '
@@ -808,6 +811,7 @@ def main():
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
             async_scheduling=inst_cfg["async_scheduling"],
+            local_scheduling_policy=args.local_scheduling_policy,
             acceptance_model=_build_acceptance_model(
                 instance["model_name"], inst_cfg, instance["node_id"], instance_id),
         ))
@@ -986,7 +990,7 @@ def main():
         # Notify router of completed requests for dependency chain release
         if instances[instance_id]["pd_type"] != "prefill":
             for req in finished_reqs:
-                router.notify_request_completed(req.id, current)
+                router.notify_request_completed(req.id, current, req=req)
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:

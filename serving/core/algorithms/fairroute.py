@@ -1,6 +1,7 @@
 """Predictors and decision primitives for the routing policies."""
 
 import math
+from .utils import tiebreak_jitter
 
 
 def iteration_time(
@@ -88,7 +89,8 @@ def _candidate_load_headrooms(candidates):
 
 
 def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
-                               urgency=0.0, rho=0.25, eps_max=0.05):
+                               urgency=0.0, rho=0.25, eps_max=0.05,
+                               request_index=0):
     """Choose a candidate using one FairRoute combination form.
 
     Every scoring mode incorporates **both** replica-level and client-level
@@ -192,6 +194,7 @@ def choose_fairroute_candidate(candidates, mode="SLACK_LEXICOGRAPHIC",
                 cf[id(item)],              # client-level fairness
                 item["replica_deficit"],   # replica-level fairness
                 -item["predicted_latency"],
+                -tiebreak_jitter(request_index, item["index"]),
             ),
         )
     return selected, epsilon

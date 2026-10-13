@@ -56,6 +56,16 @@ export LAM_W4=0.5
 export LAM_W5=4
 ```
 
+These are the current RR saturation-rate estimates (requests/s, except W4
+session starts/s), read from the observed RR knee in the checked-in analysis
+outputs. The pilot traces exist, but there are no RR pilot result files under
+`outputs/fairroute/pilot/` yet. Run the pilot with RR and point the notebook at
+those results to replace these estimates with direct pilot measurements before
+regenerating the workload suite. The notebook documents the knee rule and
+prints the suggested `LAM_*` assignments.
+
+Analysis notebook: [`notebooks/fairroute_rr_breaking_point.ipynb`](notebooks/fairroute_rr_breaking_point.ipynb).
+
 You can first inspect the commands without generating files:
 
 ```bash

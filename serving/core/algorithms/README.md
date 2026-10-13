@@ -1,5 +1,27 @@
 # Routing Algorithms & FairRoute Implementation Guide
 
+## Published policy implementations
+
+`published.py` contains stateful policy primitives. `VTC` and `DLPM` are wired
+into the scheduler through `--local-scheduling-policy {FCFS,VTC,DLPM}`;
+`D2LPMRouter` is used by router policy `D2LPM`. The D²LPM implementation uses
+the literal paper input-token dispatch charge and `len(waiting)` as its worker
+queue signal. Its prefix shadow index is block-hash granular and is populated
+at dispatch. When traces omit token IDs, locality has no signal.
+
+`PrebleE2`, `PerfModel`, and `lens_search` are reusable algorithm components,
+but are not yet registered as an end-to-end serving policy. The existing
+`PRISM` route is a configurable simulator scoring approximation; it does not
+claim the paper's unspecified score functions as a reproduction. In particular,
+do not label a PRISM/LENS experiment as NexusSched until LENS is connected to
+the actual scheduler's batch allocation and its model is fitted to observed
+simulator batches. Preble likewise needs calibrated PT/DT functions and local
+priority-group scheduling before the full system can be claimed.
+
+VTC/DLPM counters are local to each scheduler. In prefill/decode disaggregation,
+the two workers therefore maintain separate counter state; this is a simulator
+integration choice and is not a global cross-worker fairness guarantee.
+
 This directory (`serving/core/algorithms/`) contains the modular scoring functions and fairness tracking logic for request routing in **LLMServingSim**.
 
 ---

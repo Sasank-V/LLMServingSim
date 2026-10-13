@@ -45,17 +45,17 @@ CONTAINER="${CONTAINER:-servingsim_docker}"
 DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
-SKIP_EXISTING="${SKIP_EXISTING:-1}"
-PARALLEL_JOBS="${PARALLEL_JOBS:-6}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-8}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 # Per-simulation wall-clock timeout in seconds (0 = no timeout).
 # Protects the run from a single hung simulation stalling the entire matrix.
 SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
-MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/main}"
+MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/pilot}"
 MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
-MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute}"
+MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute/pilot}"
 MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"
 MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
 MATRIX_SEED="${MATRIX_SEED:-42}"
@@ -66,12 +66,15 @@ REAL_WORKLOAD="${REAL_WORKLOAD:-workloads/workload-llama8b-full-sps10-100clients
 REAL_WORKLOAD_LIMIT="${REAL_WORKLOAD_LIMIT:-1000}"
 MATRIX_STATUS_FILE="${MATRIX_STATUS_FILE:-$MATRIX_OUTPUT_DIR/matrix_status.txt}"
 MATRIX_LOG_FILE="${MATRIX_LOG_FILE:-$MATRIX_OUTPUT_DIR/matrix.log}"
+# MATRIX_POLICIES=(
+#   RR LOAD RAND
+#   FAIRROUTE_V2 FAIRROUTE_GATED FAIRROUTE_SLACK
+#   PRISM D2LPM
+# )
 MATRIX_POLICIES=(
-  RR LOAD RAND
-  FAIRROUTE FAIRROUTE_V2 FAIRROUTE_LINEAR FAIRROUTE_MULTIPLICATIVE
-  FAIRROUTE_GATED FAIRROUTE_LEXICOGRAPHIC FAIRROUTE_SLACK FAIRROUTE_LEARNED
-  PRISM D2LPM
+  RR
 )
+MATRIX_LOCAL_POLICY="${MATRIX_LOCAL_POLICY:-FCFS}"
 
 # --- Sweep-specific (was scripts/run_client_sweep.sh) -----------------------
 SWEEP_WORKLOAD_DIR="${SWEEP_WORKLOAD_DIR:-workloads/client_sweep}"
@@ -263,6 +266,8 @@ run_matrix_stage() {
     -e "REAL_WORKLOAD=$REAL_WORKLOAD" \
     -e "REAL_WORKLOAD_LIMIT=$REAL_WORKLOAD_LIMIT" \
     -e "MATRIX_NUM_REQS=$MATRIX_NUM_REQS" \
+    -e "MATRIX_POLICIES=${MATRIX_POLICIES[*]}" \
+    -e "MATRIX_LOCAL_POLICY=$MATRIX_LOCAL_POLICY" \
     -e "CACHE_MODE=$CACHE_MODE" \
     -e "STATUS_FILE=$MATRIX_STATUS_FILE" \
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
@@ -305,12 +310,15 @@ if [[ "$INCLUDE_REAL_WORKLOAD" == "1" ]]; then
   fi
 fi
 
-POLICIES=(
-  RR LOAD RAND
-  FAIRROUTE FAIRROUTE_V2 FAIRROUTE_LINEAR FAIRROUTE_MULTIPLICATIVE
-  FAIRROUTE_GATED FAIRROUTE_LEXICOGRAPHIC FAIRROUTE_SLACK FAIRROUTE_LEARNED
-  PRISM D2LPM
-)
+if [[ -n "${MATRIX_POLICIES:-}" ]]; then
+  read -r -a POLICIES <<< "$MATRIX_POLICIES"
+else
+  POLICIES=(
+    RR LOAD RAND
+    FAIRROUTE_V2 FAIRROUTE_GATED FAIRROUTE_SLACK
+    PRISM D2LPM
+  )
+fi
 
 mapfile -d '' datasets < <(
   find "$WORKLOAD_DIR" -type f -name "${WORKLOAD_PATTERN:-trace.jsonl}" -print0 | sort -z
@@ -351,8 +359,12 @@ run_policy() {
   local dataset="$1"
   local scenario="$2"
   local policy="$3"
-  local output="$OUTPUT_DIR/${scenario}_policy_${policy}.csv"
-  local state_key="${scenario//\//__}__${policy}"
+  local local_suffix=""
+  if [[ "${MATRIX_LOCAL_POLICY:-FCFS}" != "FCFS" ]]; then
+    local_suffix="_local_${MATRIX_LOCAL_POLICY}"
+  fi
+  local output="$OUTPUT_DIR/${scenario}_policy_${policy}${local_suffix}.csv"
+  local state_key="${scenario//\//__}__${policy}${local_suffix}"
   local run_key="${scenario//\//__}"
   local state_file="$STATE_DIR/$state_key.running"
   local expected_rows actual_rows
@@ -396,6 +408,7 @@ run_policy() {
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
+      --local-scheduling-policy "${MATRIX_LOCAL_POLICY:-FCFS}" \
       --dtype bfloat16 --block-size 16 \
       "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
