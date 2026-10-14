@@ -7,6 +7,19 @@ from collections import defaultdict, deque
 import math
 
 
+def iteration_time(batch_size, sequence_count, *, tau0=0.001, w0=0.001,
+                   ws=0.00001, p_max=2048.0, k_batch=0.05,
+                   k_sequence=0.05, tau_batch=0.00001,
+                   tau_sequence=0.00001):
+    """NexusSched saturation model used by simulator latency predictions."""
+    batch = max(0.0, float(batch_size))
+    sequences = max(0.0, float(sequence_count))
+    throughput = p_max * (1.0-math.exp(-k_batch*batch)) * (1.0-math.exp(-k_sequence*sequences))
+    if throughput <= 0:
+        return tau0 + tau_batch*batch + tau_sequence*sequences
+    return tau0 + (w0 + ws*sequences)/throughput + tau_batch*batch + tau_sequence*sequences
+
+
 class VTC:
     """Virtual-time fairness, charged for prompt at admission and output per step."""
     def __init__(self, w_p=1.0, w_q=2.0):

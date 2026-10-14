@@ -78,6 +78,7 @@ class Request:
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None
         self.sub_request_index = None
+        self.trace_index = None
 
         self.routing_fairness_debt = 0.0
         self.routing_fairness_urgency = 0.0
@@ -90,6 +91,9 @@ class Request:
         self.routing_gate_size = 0
         self.routing_slack_size = 0
         self.routing_credit_exhausted = False
+        self.routing_slack_used = 0.0
+        self.routing_slo_risk = False
+        self.routing_credit = 0.0
         self.routing_decision_ns = 0
 
     # to print the request information
@@ -205,4 +209,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

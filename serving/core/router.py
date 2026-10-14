@@ -1,5 +1,4 @@
 import bisect
-import hashlib
 import json
 import math
 import os
@@ -15,13 +14,12 @@ from .algorithms.fairness import (
 from .algorithms.fairroute import (
     choose_fairroute_candidate,
     fairroute_gate,
-    iteration_time,
     predict_latency_seconds,
 )
 from .algorithms.locality import locality_score
 from .algorithms.prediction import predict_queue, replica_is_safe
 from .algorithms.utils import kv_utilization, reactive_load, tiebreak_jitter
-from .algorithms.published import D2LPMRouter
+from .algorithms.published import D2LPMRouter, iteration_time
 from .kv_cache_manager import request_block_hashes
 from .logger import get_logger
 
@@ -57,8 +55,6 @@ class Router:
         self._client_output_ewma = {}
         self._client_credit = {}
         self._client_delay_ewma = {}
-        self._client_delay_samples = {}
-        self._client_credit_refill = {}
         self._replica_service = {}
         self._known_clients = set()
         self.custom_routing_fn = custom_routing_fn
@@ -71,11 +67,11 @@ class Router:
             "prism_p": 4.0,
             "prism_beta": 2.0,
             "h_min": 16,
+            "prediction_slo_k": 10.0,
             "fairroute_h_min": 256,
             "fairroute_gamma": 1.0,
             "fairroute_eps_max": 0.100,
             "fairroute_rho_slack": 0.25,
-            "fairroute_k": 10.0,
             "credit_w_e": 1.0,
             "credit_w_q": 2.0,
             "credit_kappa": 1.0,
@@ -85,13 +81,11 @@ class Router:
         self._routed_margins = []
         self._routing_stage_counts = {}
         self._decision_records = []
-        self._routing_policy_names = {
-            "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_LINEAR",
-            "FAIRROUTE_MULTIPLICATIVE", "FAIRROUTE_GATED",
-            "FAIRROUTE_LEXICOGRAPHIC", "FAIRROUTE_SLACK",
-            "FAIRROUTE_LEARNED", "PRISM", "D2LPM",
+        self._last_policy_candidates = None
+        self._last_credit_refilled = False
+        self._fairroute_policies = {
+            "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_GATED", "FAIRROUTE_SLACK",
         }
-
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
         self._pending_idx = 0
@@ -109,13 +103,14 @@ class Router:
             self._select_instance = self._rand_select
         elif self.routing_policy == "LOAD":
             self._select_instance = self._least_load_select
-        elif self.routing_policy in self._routing_policy_names:
+        elif self.routing_policy in {"PRISM", "D2LPM"} | self._fairroute_policies:
             self._select_instance = self._fair_route
         elif self.routing_policy == "CUSTOM":
             self._select_instance = self._rr_select
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, and FairRoute policies")
+                             "Supported: RR, RAND, LOAD, PRISM, D2LPM, FAIRROUTE, "
+                             "FAIRROUTE_SLACK, FAIRROUTE_GATED, CUSTOM")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -164,142 +159,189 @@ class Router:
 
     def _fair_route(self, schedulers, role, req_data=None):
         if req_data is None:
-            raise RuntimeError("FairRoute selection requires request data")
+            raise RuntimeError("request-aware routing requires request data")
         if self.routing_policy == "PRISM":
             return self._select_prism(schedulers, req_data)
         if self.routing_policy == "D2LPM":
             return self._select_d2lpm(schedulers, req_data)
         if self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
             return self._select_fairroute_v2(schedulers, req_data)
-        return self._select_fairroute_candidate(schedulers, req_data)
+        return self._select_fairroute_variant(schedulers, req_data)
+
+    def _fairroute_credit(self, client_id, replica, schedulers):
+        """Return the per-client, per-replica FairRoute locality credit."""
+        key = (client_id, replica)
+        if key not in self._client_credit:
+            sched = schedulers[replica]
+            config = getattr(sched, "config", {})
+            self._client_credit[key] = self._policy_params["credit_kappa"] * (
+                self._policy_params["credit_w_e"] * config.get("max_position_embeddings", 2048)
+                + self._policy_params["credit_w_q"] * 1024
+            )
+        return self._client_credit[key]
+
+    def _refill_fairroute_credits(self, client_id, schedulers):
+        """Start a new FairRoute credit round once all replicas are depleted."""
+        owner_keys = [(client_id, replica) for replica in range(len(schedulers))]
+        if any(self._client_credit.get(key, 0.0) > 0 for key in owner_keys):
+            return False
+        for _, replica in owner_keys:
+            config = getattr(schedulers[replica], "config", {})
+            self._client_credit[(client_id, replica)] += self._policy_params["credit_kappa"] * (
+                self._policy_params["credit_w_e"] * config.get("max_position_embeddings", 2048)
+                + self._policy_params["credit_w_q"] * 1024
+            )
+        return True
+
+    def _fairroute_candidates(self, schedulers, req_data):
+        candidates, estimate = self._candidate_set(schedulers, req_data)
+        client_id = req_data.get("client_id", "default")
+        for candidate, sched in zip(candidates, schedulers):
+            waiting, running = len(sched.waiting), len(sched.running)
+            capacity = getattr(sched, "max_num_seqs", 0)
+            pool = getattr(sched.memory, "npu_pool", None)
+            used = getattr(pool, "used_blocks", 0) if pool else 0
+            total = getattr(pool, "num_blocks", 0) if pool else 0
+            queue = predict_queue(waiting, 0.0, 0.0, 1.0)
+            candidate.update({
+                "load": reactive_load(waiting, running, capacity),
+                "predicted_queue": queue,
+                "kv_util": kv_utilization(used, total),
+                "locality": locality_score(candidate["hit"], req_data["input_toks"]),
+                "future_locality": locality_score(candidate["hit"], req_data["input_toks"]),
+                "fairness_credit": self._fairroute_credit(client_id, candidate["index"], schedulers),
+                "replica_deficit": 0.0,
+            })
+            max_queue = max(1, capacity * 4) if capacity not in (0, float("inf")) else float("inf")
+            candidate["safe"] = replica_is_safe(queue, max_queue, candidate["kv_util"])
+        max_service = max(self._replica_service.values(), default=0.0)
+        for candidate in candidates:
+            candidate["replica_deficit"] = max_service - self._replica_service.get(candidate["index"], 0.0)
+        return candidates, estimate
 
     def _select_fairroute_v2(self, schedulers, req_data):
-        candidates, estimate = self._candidate_set(schedulers, req_data)
-        gamma = self._policy_params["fairroute_gamma"]
+        """Restore the original FairRoute-v2 gate, slack, and fairness pipeline."""
+        candidates, estimate = self._fairroute_candidates(schedulers, req_data)
+        self._last_policy_candidates = candidates
+        self._last_credit_refilled = False
         gated = [
-            c for c in candidates
-            if c["free_kv"] >= c["kv"]
-            and c["ttft"] <= gamma * c["slo"]
+            candidate for candidate in candidates
+            if candidate["free_kv"] >= candidate["kv"]
+            and candidate["ttft"] <= self._policy_params["fairroute_gamma"] * candidate["slo"]
         ]
         slo_risk = not gated
-        if not gated:
-            gated = candidates
-        best_latency = min(c["predicted_latency"] for c in gated)
+        gated = gated or candidates
+        best_latency = min(candidate["predicted_latency"] for candidate in gated)
         client_id = req_data.get("client_id", "default")
         self._known_clients.add(client_id)
-
-        # --- Client-level fairness: service-based debt urgency ----------------
-        # Computes egalitarian debt relative to mean service across all known
-        # clients and maps it to an urgency in [0, 1) via exponential saturation.
         target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
-        service_debt = fairness_debt(
-            self.fairness_tracker.get_service(client_id), target
-        )
-        service_urgency = fairness_urgency(service_debt)
-
-        # --- Client-level fairness: delay-based urgency (optional) ------------
-        # When fairroute_n0 > 0, also compare client EWMA delay to the cluster
-        # median; a client experiencing disproportionate latency gets extra pull.
-        delays = [
-            value for owner, value in self._client_delay_ewma.items()
-            if owner in self._known_clients
-        ]
-        median_delay = sorted(delays)[len(delays) // 2] if delays else 0.0
-        client_delay = self._client_delay_ewma.get(client_id, 0.0)
-        delay_urgency = 0.0
-        if self.fairroute_n0 and median_delay > 0 and client_delay / median_delay > 1:
-            delay_urgency = min(1.0, client_delay / median_delay - 1.0)
-
-        # Combined: respond to whichever fairness dimension is most violated.
-        urgency = max(service_urgency, delay_urgency)
-
-        epsilon = min(
-            self._policy_params["fairroute_eps_max"],
-            self._policy_params["fairroute_rho_slack"] * best_latency,
-        ) * (1.0 - urgency)
-        slack = [c for c in gated if c["predicted_latency"] <= best_latency + epsilon]
-        mean_service = (
-            sum(self._replica_service.get(i, 0.0) for i in range(len(schedulers)))
-            / max(1, len(schedulers))
-        )
-
-        # Normalise queued work across the slack set to get per-candidate load
-        # headroom [0, 1].  Headroom 1 = least-loaded, 0 = most-loaded.
-        queued_works = [c["W"] for c in slack]
-        w_max, w_min = max(queued_works), min(queued_works)
-        w_span = max(w_max - w_min, 1.0)
-
+        service_debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
+        urgency = fairness_urgency(service_debt)
+        if self.fairroute_n0:
+            delays = [delay for owner, delay in self._client_delay_ewma.items() if owner in self._known_clients]
+            median = sorted(delays)[len(delays) // 2] if delays else 0.0
+            if median > 0:
+                urgency = max(urgency, min(1.0, self._client_delay_ewma.get(client_id, 0.0) / median - 1.0))
+        epsilon = min(self._policy_params["fairroute_eps_max"],
+                      self._policy_params["fairroute_rho_slack"] * best_latency) * (1.0 - urgency)
+        slack = [candidate for candidate in gated if candidate["predicted_latency"] <= best_latency + epsilon]
+        mean_service = sum(self._replica_service.get(i, 0.0) for i in range(len(schedulers))) / max(1, len(schedulers))
+        max_work = max(candidate["W"] for candidate in slack)
+        min_work = min(candidate["W"] for candidate in slack)
+        work_span = max(1.0, max_work - min_work)
         for candidate in slack:
-            candidate["locality_key"] = (
-                candidate["hit"]
-                if candidate["hit"] >= self._policy_params["fairroute_h_min"]
-                and candidate["credit"] > 0
-                else 0
-            )
-            candidate["deficit"] = (
-                mean_service - candidate["service"]
-            ) / max(mean_service, 1.0)
-            # Client-level fairness signal: steer underserved clients (high
-            # urgency) toward less-loaded replicas (high headroom).  This is
-            # candidate-varying, so it creates a genuine spread across replicas
-            # rather than a uniform offset that would cancel in argmin.
-            candidate["client_fairness"] = (
-                urgency * (w_max - candidate["W"]) / w_span
-            )
-
-        _req_idx = req_data.get("index", 0)
-        selected = min(
-            slack,
-            key=lambda c: (
-                -c["locality_key"],
-                -c["client_fairness"],  # client-level fairness
-                -c["deficit"],          # replica-level fairness
-                c["predicted_latency"],
-                tiebreak_jitter(_req_idx, c["index"]),  # uniform tie-break
-            ),
-        )
-
-        client_id = selected["client_id"]
+            candidate["locality_key"] = candidate["hit"] if (
+                candidate["hit"] >= self._policy_params["fairroute_h_min"]
+                and candidate["fairness_credit"] > 0) else 0
+            candidate["deficit"] = (mean_service - self._replica_service.get(candidate["index"], 0.0)) / max(mean_service, 1.0)
+            candidate["client_fairness"] = urgency * (max_work - candidate["W"]) / work_span
+        request_index = req_data.get("index", 0)
+        selected = min(slack, key=lambda candidate: (
+            -candidate["locality_key"], -candidate["client_fairness"], -candidate["deficit"],
+            candidate["predicted_latency"], tiebreak_jitter(request_index, candidate["index"])))
         key = (client_id, selected["index"])
-        selected["credit"] -= self._policy_params["credit_w_e"] * selected["n_ext"]
-        self._client_credit[key] = selected["credit"]
-        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
-            for k in list(self._client_credit):
-                if k[0] == client_id:
-                    self._client_credit[k] += self._credit_quantum(schedulers[k[1]])
-
-        gated_latencies = sorted(c["predicted_latency"] for c in gated)
-        margin = (gated_latencies[1] - gated_latencies[0]) if len(gated_latencies) > 1 else 0.0
-        stage = "fallback" if slo_risk else ("slack" if epsilon > 0 else "gate")
-        stage = f"{stage}:lexicographic"
+        self._client_credit[key] -= self._policy_params["credit_w_e"] * selected["n_ext"]
+        self._last_credit_refilled = self._refill_fairroute_credits(client_id, schedulers)
+        self._replica_service[selected["index"]] = self._replica_service.get(selected["index"], 0.0) + (
+            self._policy_params["credit_w_e"] * selected["n_ext"] + self._policy_params["credit_w_q"] * estimate)
+        stage = ("fallback" if slo_risk else ("slack" if epsilon > 0 else "gate")) + ":lexicographic"
         self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
-        credit_exhausted = self._client_credit.get(key, 0.0) <= 0
-        score = -selected["predicted_latency"]
-        if slo_risk:
-            score -= 0.001
+        alternatives = sorted(candidate["predicted_latency"] for candidate in gated)
+        margin = alternatives[1] - alternatives[0] if len(alternatives) > 1 else 0.0
+        score = -selected["predicted_latency"] - (0.001 if slo_risk else 0.0)
         self._routed_scores.append(score)
         self._routed_margins.append(margin)
+        return selected["index"], score, (
+            service_debt, urgency, selected["hit"], selected["predicted_latency"], selected["hit"],
+            margin, len(gated), len(slack), stage, int(self._client_credit[key] <= 0), epsilon)
 
-        self._replica_service[selected["index"]] = (
-            self._replica_service.get(selected["index"], 0.0)
-            + self._policy_params["credit_w_e"] * selected["n_ext"]
-            + self._policy_params["credit_w_q"] * estimate
-        )
-
-        route_metrics = (
-            service_debt,
-            urgency,
-            selected["hit"],
-            selected["predicted_latency"],
-            selected["hit"],
-            margin,
-            len(gated),
-            len(slack),
-            stage,
-            int(credit_exhausted),
-            epsilon,
-        )
-        return selected["index"], score, route_metrics
+    def _select_fairroute_variant(self, schedulers, req_data):
+        """Restore the original GATED and SLACK FairRoute combination forms."""
+        client_id = req_data.get("client_id", "default")
+        request_index = req_data.get("index", 0)
+        self._known_clients.add(client_id)
+        target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
+        debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
+        urgency = fairness_urgency(debt)
+        output_estimate = self._client_output_estimate(client_id)
+        max_replica_service = max(self._replica_service.values(), default=0.0)
+        candidates = []
+        self._last_credit_refilled = False
+        for index, sched in enumerate(schedulers):
+            hit = self._replica_locality(sched, req_data)
+            waiting, running = len(sched.waiting), len(sched.running)
+            capacity = getattr(sched, "max_num_seqs", 0)
+            load = reactive_load(waiting, running, capacity)
+            predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
+            pool = getattr(sched.memory, "npu_pool", None)
+            used = getattr(pool, "used_blocks", 0) if pool else 0
+            total = getattr(pool, "num_blocks", 0) if pool else 0
+            kv_util = kv_utilization(used, total)
+            max_queue = max(1, capacity * 4) if capacity not in (0, float("inf")) else float("inf")
+            credit_key = (client_id, index)
+            credit = self._client_credit.setdefault(credit_key, 8192.0)
+            candidates.append({
+                "index": index,
+                "safe": replica_is_safe(predicted_queue, max_queue, kv_util),
+                "hit": hit,
+                "locality": locality_score(hit, req_data["input_toks"]),
+                "future_locality": locality_score(hit, req_data["input_toks"]),
+                "fairness_credit": credit,
+                "replica_deficit": max_replica_service - self._replica_service.get(index, 0.0),
+                "load": load,
+                "predicted_queue": predicted_queue,
+                "kv_util": kv_util,
+                "n_ext": max(0, req_data["input_toks"] - hit),
+                "W": self._queued_tokens(sched),
+                "requests": len(sched.waiting) + len(sched.running),
+                "free_kv": self._free_kv_tokens(sched),
+                "predicted_latency": predict_latency_seconds(
+                    load, req_data["input_toks"] - hit, output_estimate),
+            })
+        self._last_policy_candidates = candidates
+        feasible, slo_risk = fairroute_gate(candidates, ttft_slo=0.1, gamma=1.0)
+        mode = "GATED" if self.routing_policy == "FAIRROUTE_GATED" else "SLACK_LEXICOGRAPHIC"
+        selected, epsilon = choose_fairroute_candidate(
+            feasible, mode=mode, urgency=urgency, request_index=request_index)
+        key = (client_id, selected["index"])
+        self._client_credit[key] -= max(0, req_data["input_toks"] - selected["hit"])
+        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
+            for credit_key in list(self._client_credit):
+                if credit_key[0] == client_id:
+                    self._client_credit[credit_key] += 8192.0
+            self._last_credit_refilled = True
+        stage = "fallback" if slo_risk else "gate"
+        if epsilon > 0:
+            stage = "slack"
+        self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
+        alternatives = sorted(candidate["predicted_latency"] for candidate in feasible)
+        margin = alternatives[1] - alternatives[0] if len(alternatives) > 1 else 0.0
+        score = -selected["predicted_latency"] - (0.001 if slo_risk else 0.0)
+        self._routed_scores.append(score)
+        self._routed_margins.append(margin)
+        return selected["index"], score, (
+            debt, urgency, selected["locality"], selected["predicted_latency"], selected["hit"],
+            margin, len(feasible), len(feasible), stage, int(self._client_credit[key] <= 0), epsilon)
 
     def _request_to_route_data(self, req):
         """Build the same candidate input for routed and handed-off requests."""
@@ -342,18 +384,6 @@ class Router:
         _, npu_hit, lower_hit = sched.memory.kv.get_computed_blocks(probe)
         return min(req_data['input_toks'], npu_hit + lower_hit)
 
-    def _replica_prediction(self, sched):
-        waiting = len(sched.waiting)
-        running = len(sched.running)
-        capacity = getattr(sched, 'max_num_seqs', 0)
-        load = reactive_load(waiting, running, capacity)
-        predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
-        pool = getattr(sched.memory, 'npu_pool', None)
-        used_blocks = getattr(pool, 'used_blocks', 0) if pool else 0
-        total_blocks = getattr(pool, 'num_blocks', 0) if pool else 0
-        kv_util = kv_utilization(used_blocks, total_blocks)
-        return load, predicted_queue, kv_util
-
     def _queued_tokens(self, sched):
         """Approximate W_i from pending prompts and running remainders."""
         pending = sum(max(0, int(getattr(req, "num_tokens", req.input)))
@@ -383,7 +413,7 @@ class Router:
         ttft = math.ceil((w + n_ext) / capacity) * t_base
         decode = output_estimate * iteration_time(d + 1, d + 1, p_max=s_max)
         total = ttft + decode
-        slo = self._policy_params["fairroute_k"] * math.ceil(n_in / s_max) * iteration_time(1, s_max, p_max=s_max)
+        slo = self._policy_params["prediction_slo_k"] * math.ceil(n_in / s_max) * iteration_time(1, s_max, p_max=s_max)
         return {
             "hit": hit,
             "n_ext": n_ext,
@@ -403,34 +433,8 @@ class Router:
     def _client_output_estimate(self, client_id):
         value = self._client_output_ewma.get(client_id, self._global_output_ewma)
         if self.fairroute_n0:
-            value = (
-                value + self.fairroute_n0 * self._global_output_ewma
-            ) / (1.0 + self.fairroute_n0)
+            value = (value + self.fairroute_n0 * self._global_output_ewma) / (1.0 + self.fairroute_n0)
         return max(1.0, value)
-
-    def _credit_quantum(self, sched):
-        config = getattr(sched, "config", {})
-        max_in = config.get("max_position_embeddings", 2048)
-        max_out = 1024
-        return self._policy_params["credit_kappa"] * (
-            self._policy_params["credit_w_e"] * max_in
-            + self._policy_params["credit_w_q"] * max_out
-        )
-
-    def _credit(self, client_id, index, schedulers):
-        key = (client_id, index)
-        if key not in self._client_credit:
-            self._client_credit[key] = self._credit_quantum(schedulers[index])
-        owner_values = [
-            self._client_credit.setdefault(
-                (client_id, replica), self._credit_quantum(schedulers[replica])
-            )
-            for replica in range(len(schedulers))
-        ]
-        if not any(value > 0 for value in owner_values):
-            for replica in range(len(schedulers)):
-                self._client_credit[(client_id, replica)] += self._credit_quantum(schedulers[replica])
-        return self._client_credit[key]
 
     def _candidate_set(self, schedulers, req_data):
         client_id = req_data.get("client_id", "default")
@@ -442,8 +446,6 @@ class Router:
             terms.update({
                 "index": index,
                 "client_id": client_id,
-                "credit": self._credit(client_id, index, schedulers),
-                "service": self._replica_service.get(index, 0.0),
                 "safe": terms["free_kv"] >= terms["kv"],
             })
             candidates.append(terms)
@@ -483,121 +485,16 @@ class Router:
         selected = candidates[selected_idx]
         return self._finish_policy_choice(selected, -selected["requests"], "d2lpm", candidates)
 
-    def _refill_credits(self, client_id, schedulers):
-        for index, sched in enumerate(schedulers):
-            self._client_credit[(client_id, index)] = self._credit_quantum(sched)
-
     def _finish_policy_choice(self, selected, score, stage, candidates):
-        client_id = selected["client_id"]
-        key = (client_id, selected["index"])
-        selected["credit"] -= self._policy_params["credit_w_e"] * selected["n_ext"]
-        self._client_credit[key] = selected["credit"]
         self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
         self._routed_scores.append(score)
         self._routed_margins.append(0.0)
         return selected["index"], score, (
             0.0, 0.0, selected["hit"], selected["predicted_latency"],
             selected["hit"], 0.0, len(candidates), len(candidates),
-            stage, int(selected["credit"] <= 0), 0.0,
+            stage, 0, 0.0,
         )
 
-
-    def _select_fairroute_candidate(self, schedulers, req_data):
-        """Route with FairRoute's gate -> slack -> lexicographic pipeline."""
-        client_id = req_data.get("client_id", "default")
-        request_index = req_data.get("index", 0)
-        self._known_clients.add(client_id)
-        target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
-        debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
-        urgency = fairness_urgency(debt)
-        client_output = self._client_output_ewma.get(client_id, self._global_output_ewma)
-        if self.fairroute_n0:
-            output_estimate = (
-                client_output + self.fairroute_n0 * self._global_output_ewma
-            ) / (1.0 + self.fairroute_n0)
-        else:
-            output_estimate = client_output
-        max_replica_service = max(self._replica_service.values(), default=0.0)
-        candidates = []
-
-        for index, sched in enumerate(schedulers):
-            hit = self._replica_locality(sched, req_data)
-            locality = locality_score(hit, req_data["input_toks"])
-            waiting = len(sched.waiting)
-            running = len(sched.running)
-            capacity = getattr(sched, "max_num_seqs", 0)
-            load = reactive_load(waiting, running, capacity)
-            predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
-            pool = getattr(sched.memory, "npu_pool", None)
-            used_blocks = getattr(pool, "used_blocks", 0) if pool else 0
-            total_blocks = getattr(pool, "num_blocks", 0) if pool else 0
-            kv_util = kv_utilization(used_blocks, total_blocks)
-            max_queue = max(1, capacity * 4) if capacity not in (0, float("inf")) else float("inf")
-            safe = replica_is_safe(predicted_queue, max_queue, kv_util)
-            credit_key = (client_id, index)
-            credit = self._client_credit.setdefault(credit_key, 8192.0)
-            replica_service = self._replica_service.get(index, 0.0)
-            candidates.append({
-                "index": index,
-                "safe": safe,
-                "hit": hit,
-                "locality": locality,
-                "future_locality": locality,
-                "fairness_credit": credit,
-                "replica_deficit": max_replica_service - replica_service,
-                "load": load,
-                "predicted_queue": predicted_queue,
-                "kv_util": kv_util,
-                "predicted_latency": predict_latency_seconds(
-                    load, req_data["input_toks"] - hit, output_estimate),
-            })
-
-        feasible, slo_risk = fairroute_gate(candidates, ttft_slo=0.1, gamma=1.0)
-        gate_size = len(feasible)
-        mode_by_policy = {
-            "FAIRROUTE_LINEAR": "LINEAR",
-            "FAIRROUTE_MULTIPLICATIVE": "MULTIPLICATIVE",
-            "FAIRROUTE_GATED": "GATED",
-            "FAIRROUTE_LEXICOGRAPHIC": "LEXICOGRAPHIC",
-            "FAIRROUTE_SLACK": "SLACK_LEXICOGRAPHIC",
-            "FAIRROUTE_LEARNED": "LEARNED",
-            "FAIRROUTE": "SLACK_LEXICOGRAPHIC",
-            "FAIRROUTE_V2": "SLACK_LEXICOGRAPHIC",
-            "PRISM": "SLACK_LEXICOGRAPHIC",
-            "D2LPM": "LEARNED",
-        }
-        selected, epsilon = choose_fairroute_candidate(
-            feasible, mode=mode_by_policy[self.routing_policy], urgency=urgency,
-            request_index=req_data.get("index", 0))
-        slack_size = len(feasible)
-        stage = "fallback" if slo_risk else "gate"
-        if epsilon > 0:
-            stage = "slack"
-        if self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
-            stage = f"{stage}:lexicographic"
-        self._routing_stage_counts[stage] = self._routing_stage_counts.get(stage, 0) + 1
-        selected_index = selected["index"]
-        extend_tokens = max(0, req_data["input_toks"] - selected["hit"])
-        self._client_credit[(client_id, selected_index)] -= extend_tokens
-        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
-            for key in list(self._client_credit):
-                if key[0] == client_id:
-                    self._client_credit[key] += 8192.0
-
-        alternatives = sorted(candidate["predicted_latency"] for candidate in feasible)
-        margin = (alternatives[1] - alternatives[0]) if len(alternatives) > 1 else 0.0
-        score = -selected["predicted_latency"]
-        if slo_risk:
-            score -= 0.001
-        self._routed_scores.append(score)
-        self._routed_margins.append(margin)
-        credit_exhausted = self._client_credit[(client_id, selected_index)] <= 0
-        return selected_index, score, (
-            debt, urgency, selected["locality"],
-            selected["predicted_latency"],
-            selected["hit"], margin, gate_size, slack_size, stage,
-            int(credit_exhausted), epsilon,
-        )
 
     def get_score_stats(self):
         """Return aggregate statistics of routing scores and margins for monitoring."""
@@ -640,7 +537,6 @@ class Router:
             "decision_ns": percentiles,
             "stage_counts": dict(self._routing_stage_counts),
             "policy": self.routing_policy,
-            "fairroute_n0": self.fairroute_n0,
         }
         if self._decision_records:
             n = len(self._decision_records)
@@ -706,9 +602,9 @@ class Router:
                     break
                 row = json.loads(line)
                 if 'sub_requests' in row:
-                    self._load_agentic_session(row, enable_prefix_caching)
+                    self._load_agentic_session(row, enable_prefix_caching, loaded_lines)
                 else:
-                    self._load_flat_request(row, enable_prefix_caching)
+                    self._load_flat_request(row, enable_prefix_caching, loaded_lines)
                 loaded_lines += 1
 
         # Sort pending requests by arrival time (agentic first sub-requests
@@ -720,7 +616,7 @@ class Router:
                          len(self._pending_requests),
                          len(self._deferred_sessions))
 
-    def _load_flat_request(self, row, enable_prefix_caching):
+    def _load_flat_request(self, row, enable_prefix_caching, trace_index):
         """Load a single flat request into pending queue."""
         req_id = self._next_request_id
         self._next_request_id += 1
@@ -732,13 +628,14 @@ class Router:
             'client_id': row.get('client_id', 'default'),
             'session_id': row.get('session_id', ''),
             'sub_request_index': row.get('sub_request_index', 0),
+            'trace_index': trace_index,
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
         self._pending_requests.append(req_data)
 
-    def _load_agentic_session(self, row, enable_prefix_caching):
+    def _load_agentic_session(self, row, enable_prefix_caching, trace_index):
         """Load an agentic session: first sub-request to pending, rest deferred."""
         sub_reqs = row['sub_requests']
         if not sub_reqs:
@@ -754,6 +651,7 @@ class Router:
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
             'client_id': row.get('client_id', 'default'),
+            'trace_index': trace_index,
         }
 
         # Queue the first sub-request
@@ -766,6 +664,7 @@ class Router:
             'client_id': row.get('client_id', 'default'),
             'session_id': session_id,
             'sub_request_index': 0,
+            'trace_index': trace_index,
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
@@ -789,16 +688,14 @@ class Router:
 
             started_ns = time.perf_counter_ns()
             candidates, _ = self._candidate_set(self.prefill_schedulers, req_data)
-            slack_used = 0.0
-
             if self.routing_policy == "CUSTOM":
                 instance_id, route_score, route_metrics = self._custom_select(
                     self.prefill_schedulers, "prefill", req_data)
-            elif self.routing_policy in self._routing_policy_names:
+            elif self.routing_policy in {"PRISM", "D2LPM"} | self._fairroute_policies:
                 instance_id, route_score, route_metrics = self._select_instance(
                     self.prefill_schedulers, "prefill", req_data)
-                if len(route_metrics) > 10:
-                    slack_used = float(route_metrics[10])
+                if self.routing_policy in self._fairroute_policies:
+                    candidates = self._last_policy_candidates or candidates
             elif self.routing_policy == "RR":
                 instance_id = self._rr_select(self.prefill_schedulers, "prefill")
                 stage = "round_robin"
@@ -866,6 +763,7 @@ class Router:
             new_req.routing_policy = self.routing_policy
             new_req.session_id = req_data.get('session_id')
             new_req.sub_request_index = req_data.get('sub_request_index')
+            new_req.trace_index = req_data.get('trace_index')
             new_req.routing_score = route_score
             (new_req.routing_fairness_debt,
              new_req.routing_fairness_urgency,
@@ -880,9 +778,14 @@ class Router:
                 new_req.routing_slack_size = int(routing_details[1])
                 new_req.routing_stage = str(routing_details[2])
                 new_req.routing_credit_exhausted = bool(routing_details[3])
+            new_req.routing_slack_used = float(route_metrics[10]) if len(route_metrics) > 10 else 0.0
+            new_req.routing_slo_risk = new_req.routing_stage.startswith("fallback")
+            new_req.routing_credit = self._client_credit.get((new_req.client_id, instance_id), 0.0)
 
             cand_lats = [c["predicted_latency"] for c in candidates]
-            cand_ttfts = [c.get("ttft", c["predicted_latency"]) for c in candidates]
+            # The original GATED/SLACK forms predict end-to-end latency only;
+            # preserve that distinction rather than labelling it as a TTFT prediction.
+            cand_ttfts = [c.get("ttft") for c in candidates]
             cand_hits = [c["hit"] for c in candidates]
             cand_loads = [c.get("W", c.get("requests", 0)) for c in candidates]
             best_pred = min(range(len(candidates)), key=lambda i: cand_lats[i]) if cand_lats else 0
@@ -895,6 +798,9 @@ class Router:
                 "request_id": int(new_req.id),
                 "client_id": new_req.client_id,
                 "arrival_time_ns": int(new_req.arrival),
+                "trace_index": new_req.trace_index,
+                "session_id": new_req.session_id,
+                "sub_request_index": new_req.sub_request_index,
                 "policy": self.routing_policy,
                 "chosen_replica": int(instance_id),
                 "decision_ns": int(decision_ns),
@@ -904,12 +810,21 @@ class Router:
                 "total_candidates": len(candidates),
                 "urgency": float(getattr(new_req, 'routing_fairness_urgency', 0.0)),
                 "fairness_debt": float(getattr(new_req, 'routing_fairness_debt', 0.0)),
-                "slack_used": slack_used,
+                "slack_used": float(getattr(new_req, 'routing_slack_used', 0.0)),
+                "slo_risk": bool(getattr(new_req, 'routing_slo_risk', False)),
+                "chosen_credit": float(getattr(new_req, 'routing_credit', 0.0)),
+                "credit_refilled": bool(self._last_credit_refilled),
                 "credit_exhausted": bool(getattr(new_req, 'routing_credit_exhausted', False)),
                 "per_replica_predicted_latency": [float(x) for x in cand_lats],
-                "per_replica_predicted_ttft": [float(x) for x in cand_ttfts],
+                "per_replica_predicted_ttft": [float(x) if x is not None else None for x in cand_ttfts],
                 "per_replica_hit_tokens": [int(x) for x in cand_hits],
+                "per_replica_extend_tokens": [float(c.get("n_ext", 0.0)) for c in candidates],
+                "per_replica_free_kv_tokens": [float(c.get("free_kv", 0.0)) for c in candidates],
                 "per_replica_load": [float(x) for x in cand_loads],
+                "per_replica_queue_tokens": [float(c.get("W", 0.0)) for c in candidates],
+                "per_replica_request_count": [int(c.get("requests", 0)) for c in candidates],
+                "per_replica_safe": [bool(c.get("safe", False)) for c in candidates],
+                "per_replica_deficit": [float(c.get("replica_deficit", 0.0)) for c in candidates],
                 "best_predicted_replica": int(best_pred),
                 "max_locality_replica": int(max_hit_idx),
                 "locality_sacrificed": loc_sacrificed,
@@ -922,9 +837,7 @@ class Router:
             self._request_service[new_req.id] = new_req.output - new_req.input
             self._request_arrivals[new_req.id] = new_req.arrival
             self._request_instances[new_req.id] = instance_id
-            self._request_output_estimates[new_req.id] = self._client_output_estimate(
-                new_req.client_id
-            )
+            self._request_output_estimates[new_req.id] = self._client_output_estimate(new_req.client_id)
 
             self._pending_idx += 1
             routed += 1
@@ -959,9 +872,6 @@ class Router:
         if self.routing_policy == "D2LPM" and request_id in self._d2lpm.inflight:
             generated = max(0, (req.output - req.original_input)) if req is not None else service
             self._d2lpm.on_finish(request_id, generated)
-        expected_output = self._request_output_estimates.pop(
-            request_id, self._global_output_ewma
-        )
         self.fairness_tracker.record_service(client_id, service)
         previous_output = self._client_output_ewma.get(client_id, float(service))
         self._client_output_ewma[client_id] = 0.1 * float(service) + 0.9 * previous_output
@@ -969,30 +879,15 @@ class Router:
         self._global_output_samples = self._global_output_samples[-101:]
         ordered = sorted(self._global_output_samples)
         self._global_output_ewma = ordered[len(ordered) // 2]
+        expected_output = self._request_output_estimates.pop(request_id, self._global_output_ewma)
         delay = float(completion_time_ns - arrival)
         previous_delay = self._client_delay_ewma.get(client_id, delay)
         self._client_delay_ewma[client_id] = 0.05 * delay + 0.95 * previous_delay
         self._global_delay_ewma = 0.05 * delay + 0.95 * self._global_delay_ewma
-        if instance_id is not None and self.routing_policy in {"D2LPM", "FAIRROUTE", "FAIRROUTE_V2"}:
-            key = (client_id, instance_id)
-            if self.routing_policy == "D2LPM":
-                self._client_credit[key] = self._client_credit.get(key, 0.0) - (
-                    self._policy_params["credit_w_q"] * service
-                )
-            elif self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
-                # Correct replica_service for output-length prediction error.
-                # The correction is bounded to [-service, +service] so a
-                # persistent estimator bias does not compound without limit;
-                # the running total is floored at 0 so it never goes negative.
-                raw_correction = self._policy_params["credit_w_q"] * (service - expected_output)
-                bounded_correction = max(-float(service), min(float(service), raw_correction))
-                self._replica_service[instance_id] = max(
-                    0.0,
-                    self._replica_service.get(instance_id, 0.0) + bounded_correction,
-                )
-        if instance_id is not None:
-            if self.routing_policy not in {"FAIRROUTE", "FAIRROUTE_V2"}:
-                self._replica_service[instance_id] = self._replica_service.get(instance_id, 0.0) + service
+        if instance_id is not None and self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
+            correction = self._policy_params["credit_w_q"] * (service - expected_output)
+            self._replica_service[instance_id] = max(
+                0.0, self._replica_service.get(instance_id, 0.0) + max(-float(service), min(float(service), correction)))
         latency = getattr(req, "latency", -1) if req is not None else -1
         if latency < 0:
             latency = completion_time_ns - arrival
@@ -1024,6 +919,7 @@ class Router:
                 'client_id': session['client_id'],
                 'session_id': session_id,
                 'sub_request_index': next_idx,
+                'trace_index': session.get('trace_index'),
             }
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
@@ -1080,7 +976,7 @@ class Router:
 
     def transfer_prefill_request(self, requests):
         for req in requests:
-            if self.routing_policy in self._routing_policy_names:
+            if self.routing_policy in {"PRISM", "D2LPM"} | self._fairroute_policies:
                 instance_id, _, _ = self._select_instance(
                     self.decode_schedulers,
                     "decode",

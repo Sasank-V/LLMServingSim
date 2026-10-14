@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # scripts/run_fairroute_experiments.sh
 #
-# Unified entry point for the two FairRoute experiment drivers that used to be
+# Unified entry point for the policy matrix and client-count experiment drivers that used to be
 # separate scripts:
-#   - the FairRoute policy matrix (3 baselines + explicit FairRoute forms)
+#   - the request-routing policy matrix
 #   - scripts/run_client_sweep.sh                 (client-count scalability sweep)
 #
 # Usage:
@@ -53,10 +53,10 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 SIM_TIMEOUT="${SIM_TIMEOUT:-1800}"
 
 # --- Matrix-specific (was scripts/run_fairroute_hypothesis_matrix.sh) ------
-MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/pilot}"
+MATRIX_WORKLOAD_DIR="${MATRIX_WORKLOAD_DIR:-workloads/fairroute/main}"
 MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
-MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute/pilot}"
-MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-0}"
+MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute/main}"
+MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-1000}"
 MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
 MATRIX_SEED="${MATRIX_SEED:-42}"
 MATRIX_WORKLOAD_SCENARIOS="${MATRIX_WORKLOAD_SCENARIOS:-c0_calibration,balanced_control,locality_conflict,fairness_conflict,prediction_burst,full_adversarial,u5_vtc_as_published,w2_heavy_light,w4_flooding,u2_multiturn,u3_loogle_proxy}"
@@ -66,15 +66,15 @@ REAL_WORKLOAD="${REAL_WORKLOAD:-workloads/workload-llama8b-full-sps10-100clients
 REAL_WORKLOAD_LIMIT="${REAL_WORKLOAD_LIMIT:-1000}"
 MATRIX_STATUS_FILE="${MATRIX_STATUS_FILE:-$MATRIX_OUTPUT_DIR/matrix_status.txt}"
 MATRIX_LOG_FILE="${MATRIX_LOG_FILE:-$MATRIX_OUTPUT_DIR/matrix.log}"
-# MATRIX_POLICIES=(
-#   RR LOAD RAND
-#   FAIRROUTE_V2 FAIRROUTE_GATED FAIRROUTE_SLACK
-#   PRISM D2LPM
-# )
-MATRIX_POLICIES=(
-  RR
-)
+# Router policies. Use MATRIX_LOCAL_POLICIES="FCFS VTC DLPM" for the factorial
+# routing × local-scheduling comparison; MATRIX_LOCAL_POLICY remains a
+# backwards-compatible single-policy override.
+# Keep these as space-separated strings: environment variables are strings,
+# and the container expands them into Bash arrays immediately before dispatch.
+# Initializing them as arrays here would overwrite caller-provided values.
+MATRIX_POLICIES="${MATRIX_POLICIES:-RR LOAD RAND PRISM D2LPM FAIRROUTE FAIRROUTE_SLACK FAIRROUTE_GATED}"
 MATRIX_LOCAL_POLICY="${MATRIX_LOCAL_POLICY:-FCFS}"
+MATRIX_LOCAL_POLICIES="${MATRIX_LOCAL_POLICIES:-$MATRIX_LOCAL_POLICY}"
 
 # --- Sweep-specific (was scripts/run_client_sweep.sh) -----------------------
 SWEEP_WORKLOAD_DIR="${SWEEP_WORKLOAD_DIR:-workloads/client_sweep}"
@@ -84,9 +84,6 @@ SWEEP_NUM_REQS="${SWEEP_NUM_REQS:-500}"
 SWEEP_STATUS_FILE="${SWEEP_STATUS_FILE:-$SWEEP_OUTPUT_DIR/sweep_status.txt}"
 SWEEP_LOG_FILE="${SWEEP_LOG_FILE:-$SWEEP_OUTPUT_DIR/sweep.log}"
 CLIENT_COUNTS=(5 10 20 50 100 200)
-SWEEP_POLICIES=(
-  FAIRROUTE_V2 LOAD RR RAND FAIRROUTE_GATED FAIRROUTE_SLACK FAIRROUTE_LEARNED
-)
 
 # --- Combined-run control files (used only for MODE=all) -------------------
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-outputs/run_all}"
@@ -268,6 +265,7 @@ run_matrix_stage() {
     -e "MATRIX_NUM_REQS=$MATRIX_NUM_REQS" \
     -e "MATRIX_POLICIES=${MATRIX_POLICIES[*]}" \
     -e "MATRIX_LOCAL_POLICY=$MATRIX_LOCAL_POLICY" \
+    -e "MATRIX_LOCAL_POLICIES=$MATRIX_LOCAL_POLICIES" \
     -e "CACHE_MODE=$CACHE_MODE" \
     -e "STATUS_FILE=$MATRIX_STATUS_FILE" \
     "$CONTAINER" bash -s <<'CONTAINER_SCRIPT'
@@ -315,10 +313,11 @@ if [[ -n "${MATRIX_POLICIES:-}" ]]; then
 else
   POLICIES=(
     RR LOAD RAND
-    FAIRROUTE_V2 FAIRROUTE_GATED FAIRROUTE_SLACK
     PRISM D2LPM
+    FAIRROUTE FAIRROUTE_SLACK FAIRROUTE_GATED
   )
 fi
+read -r -a LOCAL_POLICIES <<< "${MATRIX_LOCAL_POLICIES:-${MATRIX_LOCAL_POLICY:-FCFS}}"
 
 mapfile -d '' datasets < <(
   find "$WORKLOAD_DIR" -type f -name "${WORKLOAD_PATTERN:-trace.jsonl}" -print0 | sort -z
@@ -333,7 +332,7 @@ mkdir -p "$STATE_DIR"
 if [[ "$SKIP_EXISTING" != "1" ]]; then
   rm -f "$STATE_DIR"/*
 fi
-total_jobs=$(( ${#datasets[@]} * ${#POLICIES[@]} ))
+total_jobs=$(( ${#datasets[@]} * ${#POLICIES[@]} * ${#LOCAL_POLICIES[@]} ))
 
 write_status() {
   local status="$1"
@@ -359,9 +358,10 @@ run_policy() {
   local dataset="$1"
   local scenario="$2"
   local policy="$3"
+  local local_policy="$4"
   local local_suffix=""
-  if [[ "${MATRIX_LOCAL_POLICY:-FCFS}" != "FCFS" ]]; then
-    local_suffix="_local_${MATRIX_LOCAL_POLICY}"
+  if [[ "$local_policy" != "FCFS" ]]; then
+    local_suffix="_local_${local_policy}"
   fi
   local output="$OUTPUT_DIR/${scenario}_policy_${policy}${local_suffix}.csv"
   local state_key="${scenario//\//__}__${policy}${local_suffix}"
@@ -375,7 +375,7 @@ run_policy() {
   fi
 
   : >"$state_file"
-  write_status RUNNING "$scenario/$policy"
+  write_status RUNNING "$scenario/$policy/$local_policy"
   actual_rows=0
   if [[ -s "$output" ]]; then
     actual_rows=$(wc -l <"$output")
@@ -384,14 +384,14 @@ run_policy() {
   # Remove partial/incomplete outputs from interrupted runs
   if [[ -s "$output" && "$actual_rows" -lt $((expected_rows + 1)) ]]; then
     echo "=== CLEANUP partial output ($actual_rows/$((expected_rows + 1)) rows): $scenario / $policy ==="
-    rm -f "$output" "${output%.csv}_timeseries.csv" "${output}.routing.json" "${output}.sidecar.jsonl" "${output%.csv}_sidecar.jsonl"
+    rm -f "$output" "${output%.csv}_timeseries.csv" "${output}.routing.json" "${output}.sidecar.jsonl" "${output%.csv}_sidecar.jsonl" "${output}.manifest.json"
     actual_rows=0
   fi
 
   if [[ "$SKIP_EXISTING" == "1" && "$actual_rows" -ge $((expected_rows + 1)) ]]; then
     echo "=== SKIP (complete) $scenario / $policy ==="
     mv -f "$state_file" "$STATE_DIR/$state_key.skipped"
-    write_status RUNNING "$scenario/$policy"
+    write_status RUNNING "$scenario/$policy/$local_policy"
     return 0
   fi
 
@@ -408,23 +408,23 @@ run_policy() {
   if "${timeout_prefix[@]}" python3 -m serving \
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
-      --local-scheduling-policy "${MATRIX_LOCAL_POLICY:-FCFS}" \
+      --local-scheduling-policy "$local_policy" \
       --dtype bfloat16 --block-size 16 \
       "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
       --dataset "$dataset" --num-reqs "$NUM_REQS" \
-      --run-id "fairroute_${run_key}_${policy}_${BASHPID}" \
+      --run-id "fairroute_${run_key}_${policy}_${local_policy}_${BASHPID}" \
       --output "$output" \
       --log-level WARNING; then
     mv -f "$state_file" "$STATE_DIR/$state_key.done"
-    write_status RUNNING "$scenario/$policy"
+    write_status RUNNING "$scenario/$policy/$local_policy"
   else
     local exit_code=$?
     if [[ $exit_code -eq 124 ]]; then
       echo "=== TIMEOUT $scenario / $policy (${SIM_TIMEOUT}s) ==" >&2
     fi
     mv -f "$state_file" "$STATE_DIR/$state_key.failed"
-    write_status FAILED "$scenario/$policy"
+    write_status FAILED "$scenario/$policy/$local_policy"
     return 1
   fi
 }
@@ -435,12 +435,14 @@ for dataset in "${datasets[@]}"; do
   scenario="${dataset#"$WORKLOAD_DIR"/}"
   scenario="${scenario%.jsonl}"
   for policy in "${POLICIES[@]}"; do
-    run_policy "$dataset" "$scenario" "$policy" &
-    running_jobs=$((running_jobs + 1))
-    if (( running_jobs >= PARALLEL_JOBS )); then
-      wait -n || failed_jobs=$((failed_jobs + 1))
-      running_jobs=$((running_jobs - 1))
-    fi
+    for local_policy in "${LOCAL_POLICIES[@]}"; do
+      run_policy "$dataset" "$scenario" "$policy" "$local_policy" &
+      running_jobs=$((running_jobs + 1))
+      if (( running_jobs >= PARALLEL_JOBS )); then
+        wait -n || failed_jobs=$((failed_jobs + 1))
+        running_jobs=$((running_jobs - 1))
+      fi
+    done
   done
 done
 
@@ -490,7 +492,7 @@ chmod 777 log astra-sim/inputs/runs 2>/dev/null || true
 printf '%s status=RUNNING container=%s\n' "$(date -Is)" "$HOSTNAME" >"$STATUS_FILE"
 
 CLIENT_COUNTS=(5 10 20 50 100 200)
-POLICIES=(FAIRROUTE_V2 LOAD RR RAND FAIRROUTE_GATED FAIRROUTE_SLACK FAIRROUTE_LEARNED)
+POLICIES=(LOAD RR RAND PRISM D2LPM FAIRROUTE FAIRROUTE_SLACK FAIRROUTE_GATED)
 
 case "$CACHE_MODE" in
   xpu) CACHE_ARGS=() ;;
@@ -570,7 +572,7 @@ run_policy() {
   # Remove partial/incomplete outputs from interrupted runs
   if [[ -s "$output" && "$expected_rows" -gt 0 && "$actual_rows" -lt $((expected_rows + 1)) ]]; then
     echo "=== CLEANUP partial output ($actual_rows/$((expected_rows + 1)) rows): c${n_clients}/${scenario}/${policy} ==="
-    rm -f "$output" "${output%.csv}_timeseries.csv"
+    rm -f "$output" "${output%.csv}_timeseries.csv" "${output}.manifest.json"
     actual_rows=0
   fi
 

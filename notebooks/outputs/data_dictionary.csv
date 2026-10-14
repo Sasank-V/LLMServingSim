@@ -6,6 +6,8 @@ K,int64
 rho,float64
 seed,int64
 policy_name,object
+local_policy_name,object
+policy_label,object
 n_requests,int64
 n_instances,int64
 TTFT_p50_ms,float64
@@ -73,7 +75,7 @@ E8_kv_max,float64
 E8_kv_above_90,float64
 E9_kv_imbalance,float64
 E11_wait_mean,float64
-E11_wait_max,float64
+E11_wait_max,int64
 E13_activity_min,float64
 E13_activity_mean,float64
 slowdown_p50,float64
@@ -84,6 +86,11 @@ ttft_slowdown_p99,float64
 slo_attain_k5,float64
 slo_attain_k10,float64
 goodput_tok_s,float64
+D9_heavy_p99_slowdown,float64
+D9_light_p99_slowdown,float64
+D9_flooder_p99_slowdown,float64
+D9_normal_p99_slowdown,float64
+D9_short_p99_slowdown,float64
 RR_TTFT_p99,float64
 RR_TPOT_p99,float64
 RR_E2E_p99,float64

@@ -9,6 +9,7 @@ spawns the ASTRA-Sim subprocess, and runs the iteration loop:
 import os
 import subprocess
 import argparse
+import hashlib
 import json
 import shutil
 from time import time
@@ -480,17 +481,14 @@ def main():
                         'produced matching data under perf/<hw>/<model>/<variant>/tp<N>/')
     parser.add_argument('--request-routing-policy', type=str,
                         choices=[
-                            'LOAD', 'RR', 'RAND', 'FAIRROUTE', 'FAIRROUTE_V2',
-                            'FAIRROUTE_LINEAR', 'FAIRROUTE_MULTIPLICATIVE',
-                            'FAIRROUTE_GATED', 'FAIRROUTE_LEXICOGRAPHIC',
-                            'FAIRROUTE_SLACK', 'FAIRROUTE_LEARNED',
-                            'PRISM', 'D2LPM',
+                            'LOAD', 'RR', 'RAND', 'PRISM', 'D2LPM',
+                            'FAIRROUTE', 'FAIRROUTE_V2', 'FAIRROUTE_SLACK', 'FAIRROUTE_GATED',
                             'CUSTOM',
                         ],
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
-                        'RR (round-robin), RAND (random), or one of the FairRoute/PRISM/D2LPM combination forms '
-                        '(CUSTOM is user-defined)')
+                        'RR (round-robin), RAND (random), PRISM, D2LPM, FAIRROUTE (the FairRoute-v2 pipeline), '
+                        'FAIRROUTE_SLACK, FAIRROUTE_GATED, or CUSTOM (user-defined)')
     parser.add_argument('--local-scheduling-policy', type=str,
                         choices=['FCFS', 'VTC', 'DLPM'], default='FCFS',
                         help='within-instance waiting-queue policy: FCFS, VTC, or prefix-aware DLPM')
@@ -514,7 +512,7 @@ def main():
                         'position at the pooled rate), DECAY (per-position rates, which fall with '
                         'draft position -- same mean, different spread), CUSTOM (user-defined)')
     parser.add_argument('--fairroute-n0', type=float, default=0.0,
-                        help='EWMA prior weight for FairRoute client estimates (0 preserves current behavior).')
+                        help='EWMA prior weight for FairRoute client output estimates (0 disables the prior).')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -864,8 +862,42 @@ def main():
             ts_writer.writerow([
                 'timestamp_ns', 'timestamp_s', 'instance_id', 'running_reqs', 'waiting_reqs',
                 'npu_used_mb', 'npu_util_pct', 'kv_used_blocks', 'kv_num_blocks', 'kv_util_pct',
-                'prompt_th_toks_per_s', 'gen_th_toks_per_s'
+                'prompt_th_toks_per_s', 'gen_th_toks_per_s',
+                'npu_prefix_requested_tokens', 'npu_prefix_hit_tokens',
+                'storage_prefix_requested_tokens', 'storage_prefix_hit_tokens'
             ])
+        dataset_path = dataset if dataset and os.path.exists(dataset) else f"../{dataset}" if dataset else None
+        def file_sha256(path):
+            if not path or not os.path.isfile(path):
+                return None
+            digest = hashlib.sha256()
+            with open(path, 'rb') as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        try:
+            git_commit = subprocess.check_output(
+                ['git', '-C', '..', 'rev-parse', 'HEAD'], text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            git_commit = None
+        with open(f"{target_path}.manifest.json", 'w', encoding='utf-8') as manifest_file:
+            json.dump({
+                'schema_version': 1,
+                'run_id': args.run_id,
+                'cluster_config': args.cluster_config,
+                'cluster_config_sha256': file_sha256(_cluster_config_path(args.cluster_config)),
+                'dataset': dataset,
+                'dataset_sha256': file_sha256(dataset_path),
+                'request_routing_policy': request_routing_policy,
+                'local_scheduling_policy': args.local_scheduling_policy,
+                'num_reqs': num_req,
+                'log_interval_s': log_interval,
+                'git_commit': git_commit,
+                'kv_tokens_per_instance': [
+                    sched.memory.npu_pool.num_blocks * sched.memory.npu_pool.block_size
+                    for sched in schedulers
+                ],
+            }, manifest_file, indent=2, sort_keys=True)
 
     # Simulator start
     current = 0 # current tick of the system
@@ -1289,10 +1321,12 @@ def main():
             # colour — bright enough to scan, not so dim that it
             # disappears. (The per-log-record [HH:MM:SS.mmm] stays
             # dim via sim.time because it appears every other line.)
+            interval_prompt_th = prompt_th * RATIO
+            interval_gen_th = gen_th * RATIO
             print_markup(
                 f"{log_time_str} "
-                f"[blue]Avg prompt throughput: {prompt_th * RATIO:.1f} tokens/s,[/] "
-                f"[blue]Avg generation throughput: {gen_th * RATIO:.1f} tokens/s[/]"
+                f"[blue]Avg prompt throughput: {interval_prompt_th:.1f} tokens/s,[/] "
+                f"[blue]Avg generation throughput: {interval_gen_th:.1f} tokens/s[/]"
             )
             prompt_th = 0
             gen_th = 0
@@ -1327,12 +1361,20 @@ def main():
                     used_b = getattr(pool, 'used_blocks', 0) if pool else 0
                     total_b = getattr(pool, 'num_blocks', 0) if pool else 0
                     kv_util = (used_b / total_b * 100.0) if total_b else 0.0
+                    npu_prefix_requested, npu_prefix_hits = (
+                        mem.npu_pool.stats.return_prefix_info()
+                        if getattr(mem, 'enable_prefix_caching', False) else (0, 0))
+                    storage_pool = getattr(mem, 'storage_pool', None)
+                    storage_prefix_requested, storage_prefix_hits = (
+                        storage_pool.stats.return_prefix_info() if storage_pool is not None else (0, 0))
                     with open(ts_output_file, 'a', newline='') as ts_f:
                         ts_writer = csv.writer(ts_f)
                         ts_writer.writerow([
                             current, f"{current / FREQ:.3f}", inst_id, running_reqs, waiting_reqs,
                             f"{npu_used_mb:.2f}", f"{npu_util:.3f}", used_b, total_b, f"{kv_util:.3f}",
-                            f"{prompt_th * RATIO:.1f}", f"{gen_th * RATIO:.1f}"
+                            f"{interval_prompt_th:.1f}", f"{interval_gen_th:.1f}",
+                            npu_prefix_requested, npu_prefix_hits,
+                            storage_prefix_requested, storage_prefix_hits,
                         ])
 
             ######### Per Node Metrics #########

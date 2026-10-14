@@ -882,7 +882,7 @@ class Scheduler:
                     'routing slack size', 'routing credit exhausted',
                     'prefix_cache_hit', 'npu_cache_hit', 'storage_cache_hit',
                     'recompute_tokens', 'num_preemptions',
-                    'session_id', 'sub_request_index', 'local scheduling policy'
+                    'session_id', 'sub_request_index', 'trace_index', 'local scheduling policy'
                 ])
             
             # Write each request's information
@@ -920,6 +920,7 @@ class Scheduler:
                     getattr(req, 'num_preemptions', 0),
                     getattr(req, 'session_id', ''),
                     getattr(req, 'sub_request_index', ''),
+                    getattr(req, 'trace_index', ''),
                     self.local_scheduling_policy,
                 ])
 
