@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the FairRoute workload suite: 5 workloads, main matrix at K=16, scaling cells for W1 and W3.
 #   ./scripts/build_fairroute_suite.sh <pilot|main|scaling|check>
-# W1 FAIRMIX (2 heavy + K-2 light) | W2 LENMIX | W3 FLOOD (PROXY) | W4 ARENA sessions | W5 BURST (Azure replay)
+# W1 FAIRMIX (2 heavy + K-2 light) | W2 LENMIX | W3 RAG flood/cache pressure | W4 ARENA sessions | W5 BURST (Azure replay)
 # Order: pilot -> run RR in the simulator -> set LAM_W1..LAM_W5 -> main -> scaling.
 # DRY=1 prints the commands without running them. Existing traces are skipped unless FORCE=1.
 set -euo pipefail
@@ -21,15 +21,19 @@ fi
 CONV="${CONV:-workloads/datasets/convert_to_llmservingsim.py}"
 RAW="${RAW:-workloads/datasets/raw}"
 SG="${SG:-$RAW/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json}"
+RAG_ARXIV_DIR="${RAG_ARXIV_DIR:-$RAW/arxiv_summarization/data}"
+RAG_TOKENIZER="${RAG_TOKENIZER:-$RAW/llama31_8b_tokenizer/tokenizer.json}"
 AZ_GLOB="${AZ_GLOB:-AzureLLMInferenceTrace_conv*.csv}"
 OUT="${OUT:-workloads/fairroute}"
 N="${N:-10000}"; NSESS="${NSESS:-8000}"
-SEEDS="${SEEDS:-100}"                 # seed 7 -> --split tune, any other seed -> --split test
+# Seed 7 is exclusively the tune split.  Main results must use independent
+# test traces; these defaults make a one-seed headline impossible by accident.
+SEEDS="${SEEDS:-101 102 103 104 105}"
 WL="${WL:-w1 w2 w3 w4 w5}"
 LEVELS="${LEVELS:-0.5 0.8 1.0 1.25 1.5}"
 DRY="${DRY:-0}"; FORCE="${FORCE:-0}"
 PILOT_W1="${PILOT_W1:-2 4 8 16}"; PILOT_W2="${PILOT_W2:-2 4 8 16}"; PILOT_W3="${PILOT_W3:-2 4 8 16}"
-PILOT_W4="${PILOT_W4:-0.5 1 2 4}"; PILOT_W5="${PILOT_W5:-4 8 16 32}"   # W4 = session starts/s
+PILOT_W4="${PILOT_W4:-3 6 12 24}"; PILOT_W5="${PILOT_W5:-4 8 16 32}"   # W4 = session starts/s
 
 calc() { awk "BEGIN{printf \"%.4f\", $1}"; }
 cnt()  { awk "BEGIN{printf \"%d\", $1}"; }
@@ -87,9 +91,11 @@ gen_w2() { # R S N O : 90% short chat, 5% long-prefill (arXiv), 5% long-decode (
   merge "$O/trace.jsonl" "$O/short/sharegpt.jsonl:0:short" "$O/long_prefill/arxiv_summarization.jsonl:0:long_prefill" \
     "$O/long_decode/code_reasoning.jsonl:0:long_decode"
 }
-gen_w3() { # R S N O K : flooder = 35% of requests on one 4096-token prefix; K-1 normal clients with own 512-token prefixes
+gen_w3() { # R S N O K : real arXiv/ShareGPT token proxy; cache pressure spans the cluster, not one replica
   local R=$1 S=$2 N=$3 O=$4 K=$5
-  run "$PY" -c "from workloads.datasets.flood_proxy import build_flood as b; print(b($R,$S,$N,'$O/trace.jsonl',K=$K,flood_share=0.35))"
+  run "$PY" -m workloads.datasets.rag_workloads --kind flood --out "$O/trace.jsonl" --rate "$R" --seed "$S" \
+    --count "$N" --clients "$K" --docs 12 --doc-len 3072 --arxiv-dir "$RAG_ARXIV_DIR" \
+    --sharegpt-json "$SG" --tokenizer "$RAG_TOKENIZER"
 }
 gen_w4() { # R S N O : Arena sessions, one side per row, client = model; R = session starts/s, N = sessions
   local R=$1 S=$2 N=$3 O=$4 SP; SP=$(split_for "$S")

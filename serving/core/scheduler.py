@@ -112,6 +112,11 @@ class Scheduler:
         # Not yet admitted, sorted by (arrival, id). A preempted request is
         # prepended, as in vLLM's waiting.prepend_request().
         self.waiting = []
+        # Persist the effective admission order.  This is deliberately request
+        # level so an analysis can prove that FCFS/VTC/DLPM did (or did not)
+        # reorder a particular workload rather than inferring it from equal
+        # latency aggregates.
+        self._admission_counter = 0
         self.inflight = []
         self.done = []
         self.batch_ids = -1
@@ -395,6 +400,9 @@ class Scheduler:
                 break
 
             self.waiting.remove(req)
+            req.local_admission_order = self._admission_counter
+            req.local_admission_time = current
+            self._admission_counter += 1
             if self.local_scheduling_policy == "VTC":
                 self.local_policy.on_admit(req, self.waiting)
             elif self.local_scheduling_policy == "DLPM":
@@ -882,7 +890,8 @@ class Scheduler:
                     'routing slack size', 'routing credit exhausted',
                     'prefix_cache_hit', 'npu_cache_hit', 'storage_cache_hit',
                     'recompute_tokens', 'num_preemptions',
-                    'session_id', 'sub_request_index', 'trace_index', 'local scheduling policy'
+                    'session_id', 'sub_request_index', 'trace_index', 'local scheduling policy',
+                    'local admission order', 'local admission time'
                 ])
             
             # Write each request's information
@@ -905,7 +914,7 @@ class Scheduler:
                     getattr(req, 'routing_fairness_debt', 0.0),
                     getattr(req, 'routing_fairness_urgency', 0.0),
                     getattr(req, 'routing_locality', 0.0),
-                    getattr(req, 'routing_prediction', 0.0),
+                    getattr(req, 'routing_prediction', None),
                     getattr(req, 'routing_score', 0.0),
                     getattr(req, 'routing_score_margin', 0.0),
                     getattr(req, 'routing_decision_ns', 0),
@@ -922,6 +931,8 @@ class Scheduler:
                     getattr(req, 'sub_request_index', ''),
                     getattr(req, 'trace_index', ''),
                     self.local_scheduling_policy,
+                    getattr(req, 'local_admission_order', ''),
+                    getattr(req, 'local_admission_time', ''),
                 ])
 
 

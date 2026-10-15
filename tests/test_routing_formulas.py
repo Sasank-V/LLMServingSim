@@ -53,9 +53,11 @@ def test_fairroute_zero_slack_picks_minimum_prediction():
     router = _router("FAIRROUTE")
     router._policy_params["fairroute_eps_max"] = 0.0
     candidates, _ = router._candidate_set(router.prefill_schedulers, _request())
-    expected = min(candidates, key=lambda item: item["predicted_latency"])["index"]
+    expected = min(item["predicted_latency"] for item in candidates)
     chosen, _, _ = router._select_fairroute_v2(router.prefill_schedulers, _request())
-    assert chosen == expected
+    # Equal predictions use FairRoute's stable hash tie-break rather than
+    # privileging replica zero, so assert the selection objective itself.
+    assert candidates[chosen]["predicted_latency"] == expected
 
 
 def test_rr_and_load_do_not_read_client_id():

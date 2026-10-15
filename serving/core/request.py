@@ -83,7 +83,10 @@ class Request:
         self.routing_fairness_debt = 0.0
         self.routing_fairness_urgency = 0.0
         self.routing_locality = 0.0
-        self.routing_prediction = 0.0
+        # None means no predictor was consulted.  A numeric zero is a valid
+        # value only for a genuinely instantaneous estimate and must never be
+        # used as a missing-telemetry sentinel in prediction analysis.
+        self.routing_prediction = None
         self.routing_score = 0.0
         self.routing_score_margin = 0.0
         self.routing_policy = ""

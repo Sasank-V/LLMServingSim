@@ -4,6 +4,7 @@ The local policies are deliberately independent of Scheduler so accounting and
 queue selection can be called at the simulator's admission/completion hooks.
 """
 from collections import defaultdict, deque
+import hashlib
 import math
 
 
@@ -99,15 +100,21 @@ class D2LPMRouter:
         self.prefix_workers = defaultdict(set)
         self.inflight = {}
 
-    def route(self, client, hashes, input_tokens, block_size, queue_sizes=None):
-        matches = {}
-        for worker in self.workers:
-            n = 0
-            for h in hashes:
-                if worker not in self.prefix_workers.get(h, ()):
-                    break
-                n += 1
-            matches[worker] = n
+    def route(self, client, hashes, input_tokens, block_size, queue_sizes=None,
+              predicted_latencies=None, match_blocks=None, request_index=0):
+        if match_blocks is None:
+            matches = {}
+            for worker in self.workers:
+                n = 0
+                for h in hashes:
+                    if worker not in self.prefix_workers.get(h, ()):
+                        break
+                    n += 1
+                matches[worker] = n
+        else:
+            if len(match_blocks) != len(self.workers):
+                raise ValueError("match_blocks must have one entry per worker")
+            matches = dict(zip(self.workers, match_blocks))
         longest = max(matches.values(), default=0)
         locality = {w for w, n in matches.items() if n == longest} if longest else set(self.workers)
         active = {w for w in self.workers if self.deficits[client][w] > 0}
@@ -118,12 +125,20 @@ class D2LPMRouter:
         eligible = locality & active
         pool = eligible or active
         loads = queue_sizes if queue_sizes is not None else self.queues
-        worker = min(pool, key=lambda w: (loads[w], w))
+        def jitter(worker):
+            digest = hashlib.md5(f"{request_index}:{worker}".encode()).digest()
+            return int.from_bytes(digest[:4], "little")
+        prediction = predicted_latencies or [0.0] * len(self.workers)
+        worker = min(pool, key=lambda w: (prediction[w], loads[w], jitter(w)))
         cost = input_tokens if self.charge == "input" else max(0, input_tokens - longest * block_size)
         self.deficits[client][worker] -= self.w_e * cost
         self.queues[worker] += 1
-        for h in hashes:
-            self.prefix_workers[h].add(worker)
+        # Router integration supplies live prefix-cache matches.  Do not add
+        # a permanent dispatch-time shadow entry here: it cannot observe KV
+        # eviction and otherwise turns old prefixes into false cache hits.
+        if match_blocks is None:
+            for h in hashes:
+                self.prefix_workers[h].add(worker)
         return worker
 
     def on_finish(self, request_id, output_tokens):

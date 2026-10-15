@@ -482,13 +482,16 @@ def main():
     parser.add_argument('--request-routing-policy', type=str,
                         choices=[
                             'LOAD', 'RR', 'RAND', 'PRISM', 'D2LPM',
-                            'FAIRROUTE', 'FAIRROUTE_V2', 'FAIRROUTE_SLACK', 'FAIRROUTE_GATED',
+                            'FAIRROUTE', 'FAIRROUTE_V2', 'FAIRROUTE_SLACK', 'FAIRROUTE_GATED', 'FAIRROUTE_P',
                             'CUSTOM',
                         ],
                         default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), PRISM, D2LPM, FAIRROUTE (the FairRoute-v2 pipeline), '
-                        'FAIRROUTE_SLACK, FAIRROUTE_GATED, or CUSTOM (user-defined)')
+                        'FAIRROUTE_SLACK, FAIRROUTE_GATED, FAIRROUTE_P, or CUSTOM (user-defined)')
+    parser.add_argument('--fairroute-p-params', type=str, default=None,
+                        help='JSON calibration overrides for FAIRROUTE_P, e.g. '
+                        '\'{"prefill_tps": 22000, "tpot": 0.0113}\'. Keys may omit the fp_ prefix.')
     parser.add_argument('--local-scheduling-policy', type=str,
                         choices=['FCFS', 'VTC', 'DLPM'], default='FCFS',
                         help='within-instance waiting-queue policy: FCFS, VTC, or prefix-aware DLPM')
@@ -513,6 +516,9 @@ def main():
                         'draft position -- same mean, different spread), CUSTOM (user-defined)')
     parser.add_argument('--fairroute-n0', type=float, default=0.0,
                         help='EWMA prior weight for FairRoute client output estimates (0 disables the prior).')
+    parser.add_argument('--routing-seed', type=int, default=42,
+                        help='seed for stochastic request-routing decisions. Record this with every experiment; '
+                        'use the workload seed for paired policy comparisons.')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -837,7 +843,21 @@ def main():
     controller = Controller(total_npu)
     # Global Request Router
     router = Router(num_instances, schedulers, num_req, request_routing_policy,
-                    fairroute_n0=args.fairroute_n0)
+                    seed=args.routing_seed, fairroute_n0=args.fairroute_n0)
+    if args.fairroute_p_params:
+        try:
+            fairroute_p_params = json.loads(args.fairroute_p_params)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--fairroute-p-params must be a JSON object: {exc}")
+        if not isinstance(fairroute_p_params, dict):
+            parser.error("--fairroute-p-params must be a JSON object")
+        try:
+            router._policy_params.update({
+                key if key.startswith("fp_") else f"fp_{key}": float(value)
+                for key, value in fairroute_p_params.items()
+            })
+        except (TypeError, ValueError) as exc:
+            parser.error(f"--fairroute-p-params values must be numeric: {exc}")
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)

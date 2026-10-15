@@ -13,9 +13,8 @@ from .algorithms.fairness import (
 )
 from .algorithms.fairroute import (
     choose_fairroute_candidate,
-    fairroute_gate,
-    predict_latency_seconds,
 )
+from .algorithms.fairroute_p import select_fairroute_p
 from .algorithms.locality import locality_score
 from .algorithms.prediction import predict_queue, replica_is_safe
 from .algorithms.utils import kv_utilization, reactive_load, tiebreak_jitter
@@ -81,10 +80,11 @@ class Router:
         self._routed_margins = []
         self._routing_stage_counts = {}
         self._decision_records = []
+        self._decision_record_by_request = {}
         self._last_policy_candidates = None
         self._last_credit_refilled = False
         self._fairroute_policies = {
-            "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_GATED", "FAIRROUTE_SLACK",
+            "FAIRROUTE", "FAIRROUTE_V2", "FAIRROUTE_GATED", "FAIRROUTE_SLACK", "FAIRROUTE_P",
         }
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -110,7 +110,7 @@ class Router:
         else:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
                              "Supported: RR, RAND, LOAD, PRISM, D2LPM, FAIRROUTE, "
-                             "FAIRROUTE_SLACK, FAIRROUTE_GATED, CUSTOM")
+                             "FAIRROUTE_SLACK, FAIRROUTE_GATED, FAIRROUTE_P, CUSTOM")
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -164,6 +164,8 @@ class Router:
             return self._select_prism(schedulers, req_data)
         if self.routing_policy == "D2LPM":
             return self._select_d2lpm(schedulers, req_data)
+        if self.routing_policy == "FAIRROUTE_P":
+            return select_fairroute_p(self, schedulers, req_data)
         if self.routing_policy in {"FAIRROUTE", "FAIRROUTE_V2"}:
             return self._select_fairroute_v2(schedulers, req_data)
         return self._select_fairroute_variant(schedulers, req_data)
@@ -276,60 +278,38 @@ class Router:
             margin, len(gated), len(slack), stage, int(self._client_credit[key] <= 0), epsilon)
 
     def _select_fairroute_variant(self, schedulers, req_data):
-        """Restore the original GATED and SLACK FairRoute combination forms."""
+        """Run FairRoute combination variants on the calibrated candidate model.
+
+        Variants differ only in their combination rule.  They must not silently
+        switch to a different latency predictor, otherwise a comparison of
+        GATED and SLACK is confounded by measurement rather than policy.
+        """
         client_id = req_data.get("client_id", "default")
         request_index = req_data.get("index", 0)
         self._known_clients.add(client_id)
         target = fairness_target(sum(self.fairness_tracker.service.values()), len(self._known_clients))
         debt = fairness_debt(self.fairness_tracker.get_service(client_id), target)
         urgency = fairness_urgency(debt)
-        output_estimate = self._client_output_estimate(client_id)
-        max_replica_service = max(self._replica_service.values(), default=0.0)
-        candidates = []
+        candidates, estimate = self._fairroute_candidates(schedulers, req_data)
         self._last_credit_refilled = False
-        for index, sched in enumerate(schedulers):
-            hit = self._replica_locality(sched, req_data)
-            waiting, running = len(sched.waiting), len(sched.running)
-            capacity = getattr(sched, "max_num_seqs", 0)
-            load = reactive_load(waiting, running, capacity)
-            predicted_queue = predict_queue(waiting, 0.0, 0.0, 1.0)
-            pool = getattr(sched.memory, "npu_pool", None)
-            used = getattr(pool, "used_blocks", 0) if pool else 0
-            total = getattr(pool, "num_blocks", 0) if pool else 0
-            kv_util = kv_utilization(used, total)
-            max_queue = max(1, capacity * 4) if capacity not in (0, float("inf")) else float("inf")
-            credit_key = (client_id, index)
-            credit = self._client_credit.setdefault(credit_key, 8192.0)
-            candidates.append({
-                "index": index,
-                "safe": replica_is_safe(predicted_queue, max_queue, kv_util),
-                "hit": hit,
-                "locality": locality_score(hit, req_data["input_toks"]),
-                "future_locality": locality_score(hit, req_data["input_toks"]),
-                "fairness_credit": credit,
-                "replica_deficit": max_replica_service - self._replica_service.get(index, 0.0),
-                "load": load,
-                "predicted_queue": predicted_queue,
-                "kv_util": kv_util,
-                "n_ext": max(0, req_data["input_toks"] - hit),
-                "W": self._queued_tokens(sched),
-                "requests": len(sched.waiting) + len(sched.running),
-                "free_kv": self._free_kv_tokens(sched),
-                "predicted_latency": predict_latency_seconds(
-                    load, req_data["input_toks"] - hit, output_estimate),
-            })
         self._last_policy_candidates = candidates
-        feasible, slo_risk = fairroute_gate(candidates, ttft_slo=0.1, gamma=1.0)
+        feasible = [
+            candidate for candidate in candidates
+            if candidate["safe"]
+            and candidate["ttft"] <= self._policy_params["fairroute_gamma"] * candidate["slo"]
+        ]
+        slo_risk = not feasible
+        feasible = feasible or [candidate for candidate in candidates if candidate["safe"]] or candidates
         mode = "GATED" if self.routing_policy == "FAIRROUTE_GATED" else "SLACK_LEXICOGRAPHIC"
         selected, epsilon = choose_fairroute_candidate(
-            feasible, mode=mode, urgency=urgency, request_index=request_index)
+            feasible, mode=mode, urgency=urgency,
+            rho=self._policy_params["fairroute_rho_slack"],
+            eps_max=self._policy_params["fairroute_eps_max"], request_index=request_index)
         key = (client_id, selected["index"])
-        self._client_credit[key] -= max(0, req_data["input_toks"] - selected["hit"])
-        if all(value <= 0 for (owner, _), value in self._client_credit.items() if owner == client_id):
-            for credit_key in list(self._client_credit):
-                if credit_key[0] == client_id:
-                    self._client_credit[credit_key] += 8192.0
-            self._last_credit_refilled = True
+        self._client_credit[key] -= self._policy_params["credit_w_e"] * selected["n_ext"]
+        self._last_credit_refilled = self._refill_fairroute_credits(client_id, schedulers)
+        self._replica_service[selected["index"]] = self._replica_service.get(selected["index"], 0.0) + (
+            self._policy_params["credit_w_e"] * selected["n_ext"] + self._policy_params["credit_w_q"] * estimate)
         stage = "fallback" if slo_risk else "gate"
         if epsilon > 0:
             stage = "slack"
@@ -464,7 +444,9 @@ class Router:
             s_cap = max(0.0, min(1.0, (candidate["free_kv"] - candidate["kv"]) / max(candidate["kv"], 1e-9)))
             affinity = beta if candidate["hit"] >= self._policy_params["h_min"] else 1.0
             score = s_lat * s_load * s_cap * affinity
-            if score > best or (score == best and (selected is None or candidate["requests"] < selected["requests"])):
+            if score > best or (score == best and (selected is None or (
+                    candidate["requests"], tiebreak_jitter(req_data.get("index", 0), candidate["index"])
+            ) < (selected["requests"], tiebreak_jitter(req_data.get("index", 0), selected["index"])))):
                 selected, best = candidate, score
         return self._finish_policy_choice(selected, best, "prism", candidates)
 
@@ -477,10 +459,17 @@ class Router:
             probe = type("PrefixProbe", (), {})()
             probe.input_hash_ids, probe.output_hash_ids, probe.block_hashes = token_ids, [], None
             hashes = request_block_hashes(probe, block_size)
-        client = req_data.get("client_id") or "default"
-        queues = [len(s.waiting) for s in schedulers]
+        client = req_data.get("client_id")
+        client = "default" if client is None else client
+        # Outstanding requests, not merely waiting requests, determine whether
+        # a replica is busy.  The predictor supplies the same latency signal
+        # used by the other global policies.
+        queues = [len(s.waiting) + len(s.running) for s in schedulers]
         selected_idx = self._d2lpm.route(
-            client, hashes, req_data["input_toks"], block_size, queues)
+            client, hashes, req_data["input_toks"], block_size, queues,
+            predicted_latencies=[candidate["predicted_latency"] for candidate in candidates],
+            match_blocks=[int(candidate["hit"] // block_size) for candidate in candidates],
+            request_index=req_data.get("index", 0))
         self._d2lpm.inflight[req_data["index"]] = (client, selected_idx)
         selected = candidates[selected_idx]
         return self._finish_policy_choice(selected, -selected["requests"], "d2lpm", candidates)
@@ -546,6 +535,15 @@ class Router:
             diag["mean_slack_size"] = sum(r["slack_size"] for r in self._decision_records) / n
             diag["credit_exhaustion_rate"] = sum(1 for r in self._decision_records if r["credit_exhausted"]) / n
             diag["mean_urgency"] = sum(r["urgency"] for r in self._decision_records) / n
+            observed = [r for r in self._decision_records if "observed_e2e_s" in r]
+            valid = [r for r in observed if r.get("prediction_available")]
+            diag["prediction_observation_coverage"] = len(observed) / n
+            diag["prediction_coverage"] = len(valid) / n
+            if valid:
+                errors = [r["prediction_error_s"] for r in valid]
+                diag["prediction_mae_s"] = sum(abs(error) for error in errors) / len(errors)
+                diag["prediction_rmse_s"] = math.sqrt(sum(error * error for error in errors) / len(errors))
+                diag["prediction_bias_s"] = sum(errors) / len(errors)
         return diag
 
     def save_diagnostics(self, output_file):
@@ -772,6 +770,8 @@ class Router:
              _,
              new_req.routing_score_margin,
              *routing_details) = route_metrics if len(route_metrics) >= 6 else (*route_metrics, 0.0)[:6]
+            if self.routing_policy not in ({"PRISM", "D2LPM"} | self._fairroute_policies):
+                new_req.routing_prediction = None
             new_req.routing_decision_ns = decision_ns
             if len(routing_details) >= 4:
                 new_req.routing_gate_size = int(routing_details[0])
@@ -832,6 +832,7 @@ class Router:
                 "top1_agreement": bool(instance_id == best_pred),
             }
             self._decision_records.append(decision_record)
+            self._decision_record_by_request[new_req.id] = decision_record
 
             self._request_clients[new_req.id] = new_req.client_id
             self._request_service[new_req.id] = new_req.output - new_req.input
@@ -891,6 +892,21 @@ class Router:
         latency = getattr(req, "latency", -1) if req is not None else -1
         if latency < 0:
             latency = completion_time_ns - arrival
+        decision = self._decision_record_by_request.get(request_id)
+        if decision is not None:
+            # These are observations, not routing defaults.  Keeping missing
+            # values as null lets the analysis distinguish absent telemetry
+            # from a genuine zero-latency prediction.
+            decision["observed_e2e_s"] = float(latency) / 1e9
+            decision["prediction_available"] = math.isfinite(
+                float(decision.get("per_replica_predicted_latency", [float("nan")])[decision["chosen_replica"]])
+            )
+            prediction = decision["per_replica_predicted_latency"][decision["chosen_replica"]]
+            decision["chosen_predicted_e2e_s"] = float(prediction) if decision["prediction_available"] else None
+            decision["prediction_error_s"] = (
+                float(prediction) - decision["observed_e2e_s"]
+                if decision["prediction_available"] else None
+            )
         self.fairness_tracker.record_latency(client_id, float(latency))
         if session_info is None:
             return

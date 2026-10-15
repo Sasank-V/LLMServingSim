@@ -17,10 +17,11 @@ Usage: ./scripts/generate_fairroute_workloads.sh <pilot|main|scaling|check>
 
 Examples:
   ./scripts/generate_fairroute_workloads.sh pilot
-  LAM_W1=2 LAM_W3=2 ./scripts/generate_fairroute_workloads.sh main
-  SEEDS=100 LAM_W1=2 LAM_W3=2 ./scripts/generate_fairroute_workloads.sh scaling
+  LAM_W1=2 LAM_W2=2 LAM_W3=2 LAM_W4=0.5 LAM_W5=4 ./scripts/generate_fairroute_workloads.sh main
+  SEEDS="101 102 103 104 105" LAM_W1=2 LAM_W3=2 ./scripts/generate_fairroute_workloads.sh scaling
   ./scripts/generate_fairroute_workloads.sh check
 
+Seed 7 is tuning-only; main/scaling default to held-out seeds 101–105.
 The builder automatically uses .venv-fairroute/bin/python or .venv/bin/python.
 Set PY=/absolute/path/to/python to override that selection.
 USAGE

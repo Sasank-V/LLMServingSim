@@ -45,7 +45,7 @@ CONTAINER="${CONTAINER:-servingsim_docker}"
 DOCKER_USER="${DOCKER_USER:-0:0}"
 CONFIG="${CONFIG:-configs/cluster/dual_node_multi_instance_policy_study.json}"
 CACHE_MODE="${CACHE_MODE:-xpu}"
-SKIP_EXISTING="${SKIP_EXISTING:-0}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
 PARALLEL_JOBS="${PARALLEL_JOBS:-8}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 # Per-simulation wall-clock timeout in seconds (0 = no timeout).
@@ -58,9 +58,14 @@ MATRIX_WORKLOAD_PATTERN="${MATRIX_WORKLOAD_PATTERN:-trace.jsonl}"
 MATRIX_OUTPUT_DIR="${MATRIX_OUTPUT_DIR:-outputs/fairroute/main}"
 MATRIX_NUM_REQS="${MATRIX_NUM_REQS:-1000}"
 MATRIX_NUM_CLIENTS="${MATRIX_NUM_CLIENTS:-8}"
-MATRIX_SEED="${MATRIX_SEED:-42}"
+# Space-separated test seeds.  Each trace is paired across policies.  Seed 7
+# is intentionally excluded because build_fairroute_suite reserves it for tuning.
+MATRIX_SEEDS="${MATRIX_SEEDS:-101 102 103 104 105}"
 MATRIX_WORKLOAD_SCENARIOS="${MATRIX_WORKLOAD_SCENARIOS:-c0_calibration,balanced_control,locality_conflict,fairness_conflict,prediction_burst,full_adversarial,u5_vtc_as_published,w2_heavy_light,w4_flooding,u2_multiturn,u3_loogle_proxy}"
 GENERATE_WORKLOADS="${GENERATE_WORKLOADS:-0}"
+# Set to 0 only for a tuning/calibration pilot.  Evaluation matrices must keep
+# this enabled so no incomplete or one-seed result reaches analysis.
+VALIDATE_MATRIX="${VALIDATE_MATRIX:-1}"
 INCLUDE_REAL_WORKLOAD="${INCLUDE_REAL_WORKLOAD:-0}"
 REAL_WORKLOAD="${REAL_WORKLOAD:-workloads/workload-llama8b-full-sps10-100clients.jsonl}"
 REAL_WORKLOAD_LIMIT="${REAL_WORKLOAD_LIMIT:-1000}"
@@ -72,8 +77,9 @@ MATRIX_LOG_FILE="${MATRIX_LOG_FILE:-$MATRIX_OUTPUT_DIR/matrix.log}"
 # Keep these as space-separated strings: environment variables are strings,
 # and the container expands them into Bash arrays immediately before dispatch.
 # Initializing them as arrays here would overwrite caller-provided values.
-MATRIX_POLICIES="${MATRIX_POLICIES:-RR LOAD RAND PRISM D2LPM FAIRROUTE FAIRROUTE_SLACK FAIRROUTE_GATED}"
-MATRIX_LOCAL_POLICY="${MATRIX_LOCAL_POLICY:-FCFS}"
+# MATRIX_POLICIES="${MATRIX_POLICIES:-RR LOAD RAND PRISM D2LPM FAIRROUTE FAIRROUTE_SLACK FAIRROUTE_GATED}"
+MATRIX_POLICIES="${MATRIX_POLICIES:-RR RAND LOAD FAIRROUTE FAIRROUTE_GATED FAIRROUTE_SLACK FAIRROUTE_P D2LPM PRISM}"
+MATRIX_LOCAL_POLICY="${MATRIX_LOCAL_POLICY:-FCFS VTC DLPM}"
 MATRIX_LOCAL_POLICIES="${MATRIX_LOCAL_POLICIES:-$MATRIX_LOCAL_POLICY}"
 
 # --- Sweep-specific (was scripts/run_client_sweep.sh) -----------------------
@@ -252,9 +258,10 @@ run_matrix_stage() {
     -e "OUTPUT_DIR=$MATRIX_OUTPUT_DIR" \
     -e "NUM_REQS=$MATRIX_NUM_REQS" \
     -e "NUM_CLIENTS=$MATRIX_NUM_CLIENTS" \
-    -e "GENERATOR_SEED=$MATRIX_SEED" \
+    -e "MATRIX_SEEDS=$MATRIX_SEEDS" \
     -e "WORKLOAD_SCENARIOS=$MATRIX_WORKLOAD_SCENARIOS" \
     -e "GENERATE_WORKLOADS=$GENERATE_WORKLOADS" \
+    -e "VALIDATE_MATRIX=$VALIDATE_MATRIX" \
     -e "SKIP_EXISTING=$SKIP_EXISTING" \
     -e "PARALLEL_JOBS=$PARALLEL_JOBS" \
     -e "MAX_NUM_SEQS=$MAX_NUM_SEQS" \
@@ -276,13 +283,18 @@ chmod 777 log astra-sim/inputs/runs 2>/dev/null || true
 printf '%s status=RUNNING container=%s\n' "$(date -Is)" "$HOSTNAME" >"$STATUS_FILE"
 
 if [[ "$GENERATE_WORKLOADS" == "1" ]]; then
-  echo "Generating FairRoute workloads: scenarios=$WORKLOAD_SCENARIOS seed=$GENERATOR_SEED clients=$NUM_CLIENTS"
-  python3 -m workloads.generators.generate_hypothesis_workloads \
-    --output-dir "$WORKLOAD_DIR" \
-    --num-reqs "$NUM_REQS" \
-    --num-clients "$NUM_CLIENTS" \
-    --seed "$GENERATOR_SEED" \
-    --scenarios "$WORKLOAD_SCENARIOS"
+  read -r -a seeds <<< "$MATRIX_SEEDS"
+  (( ${#seeds[@]} >= 3 )) || { echo "MATRIX_SEEDS must contain at least three held-out seeds" >&2; exit 2; }
+  for seed in "${seeds[@]}"; do
+    [[ "$seed" != 7 ]] || { echo "Seed 7 is reserved for tuning, not evaluation" >&2; exit 2; }
+    echo "Generating FairRoute workloads: scenarios=$WORKLOAD_SCENARIOS seed=$seed clients=$NUM_CLIENTS"
+    python3 -m workloads.generators.generate_hypothesis_workloads \
+      --output-dir "$WORKLOAD_DIR/seed_$seed" \
+      --num-reqs "$NUM_REQS" \
+      --num-clients "$NUM_CLIENTS" \
+      --seed "$seed" \
+      --scenarios "$WORKLOAD_SCENARIOS"
+  done
 fi
 
 case "$CACHE_MODE" in
@@ -409,6 +421,7 @@ run_policy() {
       --cluster-config "$CONFIG" \
       --request-routing-policy "$policy" \
       --local-scheduling-policy "$local_policy" \
+      --routing-seed "${ROUTING_SEED:-42}" \
       --dtype bfloat16 --block-size 16 \
       "${seq_args[@]}" \
       "${CACHE_ARGS[@]}" \
@@ -454,6 +467,17 @@ done
 if (( failed_jobs > 0 )); then
   write_status FAILED "failed_jobs=$failed_jobs"
   exit 4
+fi
+
+# Never hand an incomplete, single-seed, or telemetry-incomplete matrix to the
+# analysis notebook.  This is intentionally a hard gate rather than a warning.
+if [[ "$VALIDATE_MATRIX" == "1" ]]; then
+  python3 scripts/validate_fairroute_matrix.py "$OUTPUT_DIR" \
+    --policies "${POLICIES[@]}" \
+    --local-policies "${LOCAL_POLICIES[@]}" \
+    --report "$OUTPUT_DIR/matrix_validation.json"
+else
+  echo "Skipping matrix validation for an explicitly non-evaluation run."
 fi
 
 write_status COMPLETE
